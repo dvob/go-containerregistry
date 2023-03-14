@@ -15,14 +15,18 @@
 package remote
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -67,7 +71,7 @@ func TestGetSchema1(t *testing.T) {
 	want := `unsupported MediaType: "application/vnd.docker.distribution.manifest.v1+prettyjws", see https://github.com/google/go-containerregistry/issues/377`
 	// Should fail based on media type.
 	if _, err := desc.Image(); err != nil {
-		if _, ok := err.(*ErrSchema1); !ok {
+		if errors.Is(err, &ErrSchema1{}) {
 			t.Errorf("Image() = %v, expected remote.ErrSchema1", err)
 		}
 		if diff := cmp.Diff(want, err.Error()); diff != "" {
@@ -79,7 +83,8 @@ func TestGetSchema1(t *testing.T) {
 
 	// Should fail based on media type.
 	if _, err := desc.ImageIndex(); err != nil {
-		if _, ok := err.(*ErrSchema1); !ok {
+		var s1err ErrSchema1
+		if errors.Is(err, &s1err) {
 			t.Errorf("ImageImage() = %v, expected remote.ErrSchema1", err)
 		}
 	} else {
@@ -173,4 +178,82 @@ func TestHeadSchema1(t *testing.T) {
 	if desc.Size != int64(len(response)) {
 		t.Errorf("Descriptor.Size = %q, expected %q", desc.Size, len(response))
 	}
+}
+
+// TestHead_MissingHeaders tests that HEAD responses missing necessary headers
+// result in errors.
+func TestHead_MissingHeaders(t *testing.T) {
+	missingType := "missing-type"
+	missingLength := "missing-length"
+	missingDigest := "missing-digest"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != http.MethodHead {
+			t.Errorf("Method; got %v, want %v", r.Method, http.MethodHead)
+		}
+		if !strings.Contains(r.URL.Path, missingType) {
+			w.Header().Set("Content-Type", "My-Media-Type")
+		}
+		if !strings.Contains(r.URL.Path, missingLength) {
+			w.Header().Set("Content-Length", "10")
+		}
+		if !strings.Contains(r.URL.Path, missingDigest) {
+			w.Header().Set("Docker-Content-Digest", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
+		}
+	}))
+	defer server.Close()
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%v) = %v", server.URL, err)
+	}
+
+	for _, repo := range []string{missingType, missingLength, missingDigest} {
+		tag := mustNewTag(t, fmt.Sprintf("%s/%s:latest", u.Host, repo))
+		if _, err := Head(tag); err == nil {
+			t.Errorf("Head(%q): expected error, got nil", tag)
+		}
+	}
+}
+
+// TestRedactFetchBlob tests that a request to fetchBlob that gets redirected
+// to a URL that contains sensitive information has that information redacted
+// if the subsequent request fails.
+func TestRedactFetchBlob(t *testing.T) {
+	ctx := context.Background()
+	f := fetcher{
+		Ref: mustNewTag(t, "original.com/repo:latest"),
+		Client: &http.Client{
+			Transport: errTransport{},
+		},
+		context: ctx,
+	}
+	h, err := v1.NewHash("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+	if err != nil {
+		t.Fatal("NewHash:", err)
+	}
+	if _, err := f.fetchBlob(ctx, 0, h); err == nil {
+		t.Fatalf("fetchBlob: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "access_token=REDACTED") {
+		t.Fatalf("fetchBlob: expected error to contain redacted access token, got %v", err)
+	}
+}
+
+type errTransport struct{}
+
+func (errTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// This simulates a registry that returns a redirect upon the first
+	// request, and then returns an error upon subsequent requests. This helps
+	// test whether error redaction takes into account URLs in error messasges
+	// that are not the original request URL.
+	if req.URL.Host == "original.com" {
+		return &http.Response{
+			StatusCode: http.StatusSeeOther,
+			Header:     http.Header{"Location": []string{"https://redirected.com?access_token=SECRET"}},
+		}, nil
+	}
+	return nil, fmt.Errorf("error reaching %s", req.URL.String())
 }

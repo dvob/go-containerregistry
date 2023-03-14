@@ -19,9 +19,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/google/go-containerregistry/pkg/v1/validate"
@@ -58,8 +60,13 @@ func TestAppendIndex(t *testing.T) {
 	}, mutate.IndexAddendum{
 		Add: img,
 		Descriptor: v1.Descriptor{
+			URLs: []string{"image.example.com"},
+		},
+	}, mutate.IndexAddendum{
+		Add: l,
+		Descriptor: v1.Descriptor{
 			MediaType: types.MediaType("application/xml"),
-			URLs:      []string{"image.example.com"},
+			URLs:      []string{"blob.example.com"},
 		},
 	}, mutate.IndexAddendum{
 		Add: l,
@@ -100,18 +107,19 @@ func TestAppendIndex(t *testing.T) {
 	for i, want := range map[int]string{
 		3: "index.example.com",
 		4: "image.example.com",
-		5: "layer.example.com",
+		5: "blob.example.com",
+		6: "layer.example.com",
 	} {
 		if got := m.Manifests[i].URLs[0]; got != want {
 			t.Errorf("wrong URLs[0] for Manifests[%d]: %s != %s", i, got, want)
 		}
 	}
 
-	if got, want := m.Manifests[4].MediaType, types.MediaType("application/xml"); got != want {
+	if got, want := m.Manifests[5].MediaType, types.MediaType("application/xml"); got != want {
 		t.Errorf("wrong MediaType for layer: %s != %s", got, want)
 	}
 
-	if got, want := m.Manifests[5].MediaType, types.OCIUncompressedRestrictedLayer; got != want {
+	if got, want := m.Manifests[6].MediaType, types.OCIUncompressedRestrictedLayer; got != want {
 		t.Errorf("wrong MediaType for layer: %s != %s", got, want)
 	}
 
@@ -129,5 +137,99 @@ func TestAppendIndex(t *testing.T) {
 	})
 	if err := validate.Index(add); err != nil {
 		t.Errorf("Validate() = %v", err)
+	}
+}
+
+func TestIndexImmutability(t *testing.T) {
+	base, err := random.Index(1024, 3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ii, err := random.Index(2048, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, err := random.Image(4096, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := mutate.AppendManifests(base, mutate.IndexAddendum{
+		Add: ii,
+		Descriptor: v1.Descriptor{
+			URLs: []string{"index.example.com"},
+		},
+	}, mutate.IndexAddendum{
+		Add: i,
+		Descriptor: v1.Descriptor{
+			URLs: []string{"image.example.com"},
+		},
+	})
+
+	t.Run("index manifest", func(t *testing.T) {
+		// Check that Manifest is immutable.
+		changed, err := idx.IndexManifest()
+		if err != nil {
+			t.Errorf("IndexManifest() = %v", err)
+		}
+		want := changed.DeepCopy() // Create a copy of original before mutating it.
+		changed.MediaType = types.DockerManifestList
+
+		if got, err := idx.IndexManifest(); err != nil {
+			t.Errorf("IndexManifest() = %v", err)
+		} else if !cmp.Equal(got, want) {
+			t.Errorf("IndexManifest changed! %s", cmp.Diff(got, want))
+		}
+	})
+}
+
+// TestAppend_ArtifactType tests that appending an image manifest that has a
+// non-standard config.mediaType to an index, results in the image's
+// config.mediaType being hoisted into the descriptor inside the index,
+// as artifactType.
+func TestAppend_ArtifactType(t *testing.T) {
+	for _, c := range []struct {
+		desc, configMediaType, wantArtifactType string
+	}{{
+		desc:             "standard config.mediaType, no artifactType",
+		configMediaType:  string(types.DockerConfigJSON),
+		wantArtifactType: "",
+	}, {
+		desc:             "non-standard config.mediaType, want artifactType",
+		configMediaType:  "application/vnd.custom.something",
+		wantArtifactType: "application/vnd.custom.something",
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			img, err := random.Image(1, 1)
+			if err != nil {
+				t.Fatalf("random.Image: %v", err)
+			}
+			img = mutate.ConfigMediaType(img, types.MediaType(c.configMediaType))
+			idx := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+				Add: img,
+			})
+			mf, err := idx.IndexManifest()
+			if err != nil {
+				t.Fatalf("IndexManifest: %v", err)
+			}
+			if got := mf.Manifests[0].ArtifactType; got != c.wantArtifactType {
+				t.Errorf("manifest artifactType: got %q, want %q", got, c.wantArtifactType)
+			}
+
+			desc, err := partial.Descriptor(img)
+			if err != nil {
+				t.Fatalf("partial.Descriptor: %v", err)
+			}
+			if got := desc.ArtifactType; got != c.wantArtifactType {
+				t.Errorf("descriptor artifactType: got %q, want %q", got, c.wantArtifactType)
+			}
+
+			gotAT, err := partial.ArtifactType(img)
+			if err != nil {
+				t.Fatalf("partial.ArtifactType: %v", err)
+			}
+			if gotAT != c.wantArtifactType {
+				t.Errorf("partial.ArtifactType: got %q, want %q", gotAT, c.wantArtifactType)
+			}
+		})
 	}
 }

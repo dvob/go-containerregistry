@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,10 +27,12 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/match"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/stream"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -49,7 +50,7 @@ func TestExtractWhiteout(t *testing.T) {
 	tr := tar.NewReader(mutate.Extract(img))
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		name := header.Name
@@ -69,7 +70,7 @@ func TestExtractOverwrittenFile(t *testing.T) {
 	tr := tar.NewReader(mutate.Extract(img))
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		name := header.Name
@@ -86,7 +87,7 @@ func TestExtractOverwrittenFile(t *testing.T) {
 // TestExtractError tests that if there are any errors encountered
 func TestExtractError(t *testing.T) {
 	rc := mutate.Extract(invalidImage{})
-	if _, err := io.Copy(ioutil.Discard, rc); err == nil {
+	if _, err := io.Copy(io.Discard, rc); err == nil {
 		t.Errorf("rc.Read; got nil error")
 	} else if !strings.Contains(err.Error(), errInvalidImage.Error()) {
 		t.Errorf("rc.Read; got %v, want %v", err, errInvalidImage)
@@ -97,7 +98,7 @@ func TestExtractError(t *testing.T) {
 // tar headers) and closed without error.
 func TestExtractPartialRead(t *testing.T) {
 	rc := mutate.Extract(invalidImage{})
-	if _, err := io.Copy(ioutil.Discard, io.LimitReader(rc, 1)); err != nil {
+	if _, err := io.Copy(io.Discard, io.LimitReader(rc, 1)); err != nil {
 		t.Errorf("Could not read one byte from reader")
 	}
 	if err := rc.Close(); err != nil {
@@ -266,6 +267,46 @@ func TestMutateConfig(t *testing.T) {
 	}
 }
 
+type arbitrary struct {
+}
+
+func (arbitrary) RawManifest() ([]byte, error) {
+	return []byte(`{"hello":"world"}`), nil
+}
+func TestAnnotations(t *testing.T) {
+	anns := map[string]string{
+		"foo": "bar",
+	}
+
+	for _, c := range []struct {
+		desc string
+		in   partial.WithRawManifest
+		want string
+	}{{
+		desc: "image",
+		in:   empty.Image,
+		want: `{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":115,"digest":"sha256:5b943e2b943f6c81dbbd4e2eca5121f4fcc39139e3d1219d6d89bd925b77d9fe"},"layers":[],"annotations":{"foo":"bar"}}`,
+	}, {
+		desc: "index",
+		in:   empty.Index,
+		want: `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":null,"annotations":{"foo":"bar"}}`,
+	}, {
+		desc: "arbitrary",
+		in:   arbitrary{},
+		want: `{"annotations":{"foo":"bar"},"hello":"world"}`,
+	}} {
+		t.Run(c.desc, func(t *testing.T) {
+			got, err := mutate.Annotations(c.in, anns).RawManifest()
+			if err != nil {
+				t.Fatalf("Annotations: %v", err)
+			}
+			if d := cmp.Diff(c.want, string(got)); d != "" {
+				t.Errorf("Diff(-want,+got): %s", d)
+			}
+		})
+	}
+}
+
 func TestMutateCreatedAt(t *testing.T) {
 	source := sourceImage(t)
 	want := time.Now().Add(-2 * time.Minute)
@@ -285,26 +326,55 @@ func TestMutateCreatedAt(t *testing.T) {
 }
 
 func TestMutateTime(t *testing.T) {
-	source := sourceImage(t)
-	want := time.Time{}
-	result, err := mutate.Time(source, want)
-	if err != nil {
-		t.Fatalf("failed to mutate a config: %v", err)
-	}
+	for _, tc := range []struct {
+		name   string
+		source v1.Image
+	}{
+		{
+			name:   "image with matching history and layers",
+			source: sourceImage(t),
+		},
+		{
+			name:   "image with empty_layer history entries",
+			source: sourceImagePath(t, "testdata/source_image_with_empty_layer_history.tar"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := time.Time{}
+			result, err := mutate.Time(tc.source, want)
+			if err != nil {
+				t.Fatalf("failed to mutate a config: %v", err)
+			}
 
-	if configDigestsAreEqual(t, source, result) {
-		t.Fatal("mutating the created time MUST mutate the config digest")
-	}
+			if configDigestsAreEqual(t, tc.source, result) {
+				t.Fatal("mutating the created time MUST mutate the config digest")
+			}
 
-	got := getConfigFile(t, result).Created.Time
-	if got != want {
-		t.Fatalf("mutating the created time MUST mutate the time from %v to %v", got, want)
+			mutatedOriginalConfig := getConfigFile(t, tc.source).DeepCopy()
+			gotConfig := getConfigFile(t, result)
+
+			// manually change the fields we expect to be changed by mutate.Time
+			mutatedOriginalConfig.Author = ""
+			mutatedOriginalConfig.Created = v1.Time{Time: want}
+			for i := range mutatedOriginalConfig.History {
+				mutatedOriginalConfig.History[i].Created = v1.Time{Time: want}
+				mutatedOriginalConfig.History[i].Author = ""
+			}
+
+			if diff := cmp.Diff(mutatedOriginalConfig, gotConfig,
+				cmpopts.IgnoreFields(v1.RootFS{}, "DiffIDs"),
+			); diff != "" {
+				t.Errorf("configFile() mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
 func TestMutateMediaType(t *testing.T) {
 	want := types.OCIManifestSchema1
+	wantCfg := types.OCIConfigJSON
 	img := mutate.MediaType(empty.Image, want)
+	img = mutate.ConfigMediaType(img, wantCfg)
 	got, err := img.MediaType()
 	if err != nil {
 		t.Fatal(err)
@@ -316,12 +386,17 @@ func TestMutateMediaType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.MediaType != "" {
-		t.Errorf("MediaType should not be set for OCI media types: %v", manifest.MediaType)
+	if manifest.MediaType == "" {
+		t.Error("MediaType should be set for OCI media types")
+	}
+	if gotCfg := manifest.Config.MediaType; gotCfg != wantCfg {
+		t.Errorf("manifest.Config.MediaType = %v, wanted %v", gotCfg, wantCfg)
 	}
 
 	want = types.DockerManifestSchema2
+	wantCfg = types.DockerConfigJSON
 	img = mutate.MediaType(img, want)
+	img = mutate.ConfigMediaType(img, wantCfg)
 	got, err = img.MediaType()
 	if err != nil {
 		t.Fatal(err)
@@ -335,6 +410,9 @@ func TestMutateMediaType(t *testing.T) {
 	}
 	if manifest.MediaType != want {
 		t.Errorf("MediaType should be set for Docker media types: %v", manifest.MediaType)
+	}
+	if gotCfg := manifest.Config.MediaType; gotCfg != wantCfg {
+		t.Errorf("manifest.Config.MediaType = %v, wanted %v", gotCfg, wantCfg)
 	}
 
 	want = types.OCIImageIndex
@@ -350,8 +428,8 @@ func TestMutateMediaType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if im.MediaType != "" {
-		t.Errorf("MediaType should not be set for OCI media types: %v", im.MediaType)
+	if im.MediaType == "" {
+		t.Error("MediaType should be set for OCI media types")
 	}
 
 	want = types.DockerManifestList
@@ -375,16 +453,16 @@ func TestMutateMediaType(t *testing.T) {
 func TestAppendStreamableLayer(t *testing.T) {
 	img, err := mutate.AppendLayers(
 		sourceImage(t),
-		stream.NewLayer(ioutil.NopCloser(strings.NewReader(strings.Repeat("a", 100)))),
-		stream.NewLayer(ioutil.NopCloser(strings.NewReader(strings.Repeat("b", 100)))),
-		stream.NewLayer(ioutil.NopCloser(strings.NewReader(strings.Repeat("c", 100)))),
+		stream.NewLayer(io.NopCloser(strings.NewReader(strings.Repeat("a", 100)))),
+		stream.NewLayer(io.NopCloser(strings.NewReader(strings.Repeat("b", 100)))),
+		stream.NewLayer(io.NopCloser(strings.NewReader(strings.Repeat("c", 100)))),
 	)
 	if err != nil {
 		t.Fatalf("AppendLayers: %v", err)
 	}
 
 	// Until the streams are consumed, the image manifest is not yet computed.
-	if _, err := img.Manifest(); err != stream.ErrNotComputed {
+	if _, err := img.Manifest(); !errors.Is(err, stream.ErrNotComputed) {
 		t.Errorf("Manifest: got %v, want %v", err, stream.ErrNotComputed)
 	}
 
@@ -406,7 +484,7 @@ func TestAppendStreamableLayer(t *testing.T) {
 
 		// Consume the layer's stream and close it to compute the
 		// layer's metadata.
-		if _, err := io.Copy(ioutil.Discard, rc); err != nil {
+		if _, err := io.Copy(io.Discard, rc); err != nil {
 			t.Errorf("Reading layer %d: %v", i, err)
 		}
 		if err := rc.Close(); err != nil {
@@ -452,6 +530,13 @@ func TestCanonical(t *testing.T) {
 	cf, err := img.ConfigFile()
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, h := range cf.History {
+		want := "bazel build ..."
+		got := h.CreatedBy
+		if want != got {
+			t.Errorf("%q != %q", want, got)
+		}
 	}
 	var want, got string
 	want = cf.Architecture
@@ -519,6 +604,42 @@ func TestRemoveManifests(t *testing.T) {
 	}
 }
 
+func TestImageImmutability(t *testing.T) {
+	img := mutate.MediaType(empty.Image, types.OCIManifestSchema1)
+
+	t.Run("manifest", func(t *testing.T) {
+		// Check that Manifest is immutable.
+		changed, err := img.Manifest()
+		if err != nil {
+			t.Errorf("Manifest() = %v", err)
+		}
+		want := changed.DeepCopy() // Create a copy of original before mutating it.
+		changed.MediaType = types.DockerManifestList
+
+		if got, err := img.Manifest(); err != nil {
+			t.Errorf("Manifest() = %v", err)
+		} else if !cmp.Equal(got, want) {
+			t.Errorf("manifest changed! %s", cmp.Diff(got, want))
+		}
+	})
+
+	t.Run("config file", func(t *testing.T) {
+		// Check that ConfigFile is immutable.
+		changed, err := img.ConfigFile()
+		if err != nil {
+			t.Errorf("ConfigFile() = %v", err)
+		}
+		want := changed.DeepCopy() // Create a copy of original before mutating it.
+		changed.Author = "Jay Pegg"
+
+		if got, err := img.ConfigFile(); err != nil {
+			t.Errorf("ConfigFile() = %v", err)
+		} else if !cmp.Equal(got, want) {
+			t.Errorf("ConfigFile changed! %s", cmp.Diff(got, want))
+		}
+	})
+}
+
 func assertMTime(t *testing.T, layer v1.Layer, expectedTime time.Time) {
 	l, err := layer.Uncompressed()
 
@@ -529,7 +650,7 @@ func assertMTime(t *testing.T, layer v1.Layer, expectedTime time.Time) {
 	tr := tar.NewReader(l)
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -541,13 +662,16 @@ func assertMTime(t *testing.T, layer v1.Layer, expectedTime time.Time) {
 			t.Errorf("unexpected mod time for layer. expected %v, got %v.", expectedTime, mtime)
 		}
 	}
-
 }
 
 func sourceImage(t *testing.T) v1.Image {
+	return sourceImagePath(t, "testdata/source_image.tar")
+}
+
+func sourceImagePath(t *testing.T, tarPath string) v1.Image {
 	t.Helper()
 
-	image, err := tarball.ImageFromPath("testdata/source_image.tar", nil)
+	image, err := tarball.ImageFromPath(tarPath, nil)
 	if err != nil {
 		t.Fatalf("Error loading image: %v", err)
 	}
@@ -639,8 +763,8 @@ func (m mockLayer) MediaType() (types.MediaType, error) {
 
 func (m mockLayer) Size() (int64, error) { return 137438691328, nil }
 func (m mockLayer) Compressed() (io.ReadCloser, error) {
-	return ioutil.NopCloser(strings.NewReader("compressed times")), nil
+	return io.NopCloser(strings.NewReader("compressed times")), nil
 }
 func (m mockLayer) Uncompressed() (io.ReadCloser, error) {
-	return ioutil.NopCloser(strings.NewReader("uncompressed")), nil
+	return io.NopCloser(strings.NewReader("uncompressed")), nil
 }

@@ -2,10 +2,6 @@
 
 Get the config of an image
 
-### Synopsis
-
-Get the config of an image
-
 ```
 crane config IMAGE [flags]
 ```
@@ -19,9 +15,10 @@ crane config IMAGE [flags]
 ### Options inherited from parent commands
 
 ```
-      --insecure            Allow image references to be fetched without TLS
-      --platform platform   Specifies the platform in the form os/arch[/variant] (e.g. linux/amd64). (default all)
-  -v, --verbose             Enable debug logs
+      --allow-nondistributable-artifacts   Allow pushing non-distributable (foreign) layers
+      --insecure                           Allow image references to be fetched without TLS
+      --platform platform                  Specifies the platform in the form os/arch[/variant][:osversion] (e.g. linux/amd64). (default all)
+  -v, --verbose                            Enable debug logs
 ```
 
 ### SEE ALSO

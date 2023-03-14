@@ -1,30 +1,41 @@
+// Copyright 2022 Google LLC All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package layout
 
 import (
+	"archive/tar"
 	"bytes"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
-	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/match"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/stream"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/google/go-containerregistry/pkg/v1/validate"
 )
 
 func TestWrite(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "write-index-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	original, err := ImageIndexFromPath(testPath)
 	if err != nil {
@@ -62,12 +73,7 @@ func TestWriteErrors(t *testing.T) {
 }
 
 func TestAppendDescriptorInitializesIndex(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "write-index-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 	temp, err := Write(tmp, empty.Index)
 	if err != nil {
 		t.Fatal(err)
@@ -98,13 +104,8 @@ func TestAppendDescriptorInitializesIndex(t *testing.T) {
 	}
 }
 
-func TestAppendArtifacts(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "write-index-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+func TestRoundtrip(t *testing.T) {
+	tmp := t.TempDir()
 
 	original, err := ImageIndexFromPath(testPath)
 	if err != nil {
@@ -116,36 +117,10 @@ func TestAppendArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Let's reconstruct the original.
-	temp, err := Write(tmp, empty.Index)
-	if err != nil {
+	// Write it back.
+	if _, err := Write(tmp, original); err != nil {
 		t.Fatal(err)
 	}
-	for i, desc := range originalManifest.Manifests {
-		// Each descriptor is annotated with its position.
-		annotations := map[string]string{
-			"org.opencontainers.image.ref.name": strconv.Itoa(i + 1),
-		}
-		switch desc.MediaType {
-		case types.OCIImageIndex, types.DockerManifestList:
-			ii, err := original.ImageIndex(desc.Digest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := temp.AppendIndex(ii, WithAnnotations(annotations)); err != nil {
-				t.Fatal(err)
-			}
-		case types.OCIManifestSchema1, types.DockerManifestSchema2:
-			img, err := original.Image(desc.Digest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := temp.AppendImage(img, WithAnnotations(annotations)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
 	reconstructed, err := ImageIndexFromPath(tmp)
 	if err != nil {
 		t.Fatalf("ImageIndexFromPath() = %v", err)
@@ -160,10 +135,7 @@ func TestAppendArtifacts(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "write-index-test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	tmp := t.TempDir()
 	temp, err := Write(tmp, empty.Index)
 	if err != nil {
 		t.Fatal(err)
@@ -228,23 +200,18 @@ func TestDeduplicatedWrites(t *testing.T) {
 		log.Fatal(err)
 	}
 
-	if err := lp.WriteBlob(configDigest, ioutil.NopCloser(bytes.NewBuffer(buf.Bytes()))); err != nil {
+	if err := lp.WriteBlob(configDigest, io.NopCloser(bytes.NewBuffer(buf.Bytes()))); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := lp.WriteBlob(configDigest, ioutil.NopCloser(bytes.NewBuffer(buf.Bytes()))); err != nil {
+	if err := lp.WriteBlob(configDigest, io.NopCloser(bytes.NewBuffer(buf.Bytes()))); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestRemoveDescriptor(t *testing.T) {
 	// need to set up a basic path
-	tmp, err := ioutil.TempDir("", "remove-descriptor-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	var ii v1.ImageIndex
 	ii = empty.Index
@@ -300,12 +267,7 @@ func TestRemoveDescriptor(t *testing.T) {
 
 func TestReplaceIndex(t *testing.T) {
 	// need to set up a basic path
-	tmp, err := ioutil.TempDir("", "replace-index-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	var ii v1.ImageIndex
 	ii = empty.Index
@@ -375,12 +337,7 @@ func TestReplaceIndex(t *testing.T) {
 
 func TestReplaceImage(t *testing.T) {
 	// need to set up a basic path
-	tmp, err := ioutil.TempDir("", "replace-image-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	var ii v1.ImageIndex
 	ii = empty.Index
@@ -445,5 +402,271 @@ func TestReplaceImage(t *testing.T) {
 	}
 	if !have3 {
 		t.Fatal("could not find digest3", digest3)
+	}
+}
+
+func TestRemoveBlob(t *testing.T) {
+	// need to set up a basic path
+	tmp := t.TempDir()
+
+	var ii v1.ImageIndex = empty.Index
+	l, err := Write(tmp, ii)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create a random blob
+	b := []byte("abcdefghijklmnop")
+	hash, _, err := v1.SHA256(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.WriteBlob(hash, io.NopCloser(bytes.NewReader(b))); err != nil {
+		t.Fatal(err)
+	}
+	// make sure it exists
+	b2, err := l.Bytes(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b, b2) {
+		t.Fatal("mismatched bytes")
+	}
+	// now the real test, delete it
+	if err := l.RemoveBlob(hash); err != nil {
+		t.Fatal(err)
+	}
+	// now it should not exist
+	if _, err = l.Bytes(hash); err == nil {
+		t.Fatal("still existed after deletion")
+	}
+}
+
+func TestStreamingWriteLayer(t *testing.T) {
+	// need to set up a basic path
+	tmp := t.TempDir()
+
+	var ii v1.ImageIndex = empty.Index
+	l, err := Write(tmp, ii)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create a random streaming image and persist
+	pr, pw := io.Pipe()
+	tw := tar.NewWriter(pw)
+	go func() {
+		pw.CloseWithError(func() error {
+			body := "test file"
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     "test.txt",
+				Mode:     0600,
+				Size:     int64(len(body)),
+				Typeflag: tar.TypeReg,
+			}); err != nil {
+				return err
+			}
+			if _, err := tw.Write([]byte(body)); err != nil {
+				return err
+			}
+			return tw.Close()
+		}())
+	}()
+	img, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer: stream.NewLayer(pr),
+	})
+	if err != nil {
+		t.Fatalf("creating random streaming image failed: %v", err)
+	}
+	if _, err := img.Digest(); err == nil {
+		t.Fatal("digesting image before stream is consumed; (v1.Image).Digest() = nil, expected err")
+	}
+	// AppendImage uses writeLayer
+	if err := l.AppendImage(img); err != nil {
+		t.Fatalf("(Path).AppendImage() = %v", err)
+	}
+
+	// Check that image was persisted and is valid
+	imgDigest, err := img.Digest()
+	if err != nil {
+		t.Fatalf("(v1.Image).Digest() = %v", err)
+	}
+	img, err = l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading image after writeLayer for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(img); err != nil {
+		t.Fatalf("validate.Image() = %v", err)
+	}
+}
+
+func TestOverwriteWithWriteLayer(t *testing.T) {
+	// need to set up a basic path
+	tmp := t.TempDir()
+
+	var ii v1.ImageIndex = empty.Index
+	l, err := Write(tmp, ii)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create a random image and persist
+	img, err := random.Image(1024, 1)
+	if err != nil {
+		t.Fatalf("random.Image() = %v", err)
+	}
+	imgDigest, err := img.Digest()
+	if err != nil {
+		t.Fatalf("(v1.Image).Digest() = %v", err)
+	}
+	if err := l.AppendImage(img); err != nil {
+		t.Fatalf("(Path).AppendImage() = %v", err)
+	}
+	if err := validate.Image(img); err != nil {
+		t.Fatalf("validate.Image() = %v", err)
+	}
+
+	// get the random image's layer
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(layers); n != 1 {
+		t.Fatalf("expected image with 1 layer, got %d", n)
+	}
+
+	layer := layers[0]
+	layerDigest, err := layer.Digest()
+	if err != nil {
+		t.Fatalf("(v1.Layer).Digest() = %v", err)
+	}
+
+	// truncate the layer contents on disk
+	completeLayerBytes, err := l.Bytes(layerDigest)
+	if err != nil {
+		t.Fatalf("(Path).Bytes() = %v", err)
+	}
+	truncatedLayerBytes := completeLayerBytes[:512]
+
+	path := l.path("blobs", layerDigest.Algorithm, layerDigest.Hex)
+	if err := os.WriteFile(path, truncatedLayerBytes, os.ModePerm); err != nil {
+		t.Fatalf("os.WriteFile(layerPath, truncated) = %v", err)
+	}
+
+	// ensure validation fails
+	img, err = l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading truncated image for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(img); err == nil {
+		t.Fatal("validating image after truncating layer; validate.Image() = nil, expected err")
+	}
+
+	// try writing expected contents with WriteBlob
+	if err := l.WriteBlob(layerDigest, io.NopCloser(bytes.NewBuffer(completeLayerBytes))); err != nil {
+		t.Fatalf("error attempting to overwrite truncated layer with valid layer; (Path).WriteBlob = %v", err)
+	}
+
+	// validation should still fail
+	img, err = l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading truncated image after WriteBlob for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(img); err == nil {
+		t.Fatal("validating image after attempting repair of truncated layer with WriteBlob; validate.Image() = nil, expected err")
+	}
+
+	// try writing expected contents with writeLayer
+	if err := l.writeLayer(layer); err != nil {
+		t.Fatalf("error attempting to overwrite truncated layer with valid layer; (Path).writeLayer = %v", err)
+	}
+
+	// validation should now succeed
+	img, err = l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading truncated image after writeLayer for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(img); err != nil {
+		t.Fatalf("validating image after attempting repair of truncated layer with writeLayer; validate.Image() = %v", err)
+	}
+}
+
+func TestOverwriteWithReplaceImage(t *testing.T) {
+	// need to set up a basic path
+	tmp := t.TempDir()
+
+	var ii v1.ImageIndex = empty.Index
+	l, err := Write(tmp, ii)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create a random image and persist
+	img, err := random.Image(1024, 1)
+	if err != nil {
+		t.Fatalf("random.Image() = %v", err)
+	}
+	imgDigest, err := img.Digest()
+	if err != nil {
+		t.Fatalf("(v1.Image).Digest() = %v", err)
+	}
+	if err := l.AppendImage(img); err != nil {
+		t.Fatalf("(Path).AppendImage() = %v", err)
+	}
+	if err := validate.Image(img); err != nil {
+		t.Fatalf("validate.Image() = %v", err)
+	}
+
+	// get the random image's layer
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(layers); n != 1 {
+		t.Fatalf("expected image with 1 layer, got %d", n)
+	}
+
+	layer := layers[0]
+	layerDigest, err := layer.Digest()
+	if err != nil {
+		t.Fatalf("(v1.Layer).Digest() = %v", err)
+	}
+
+	// truncate the layer contents on disk
+	completeLayerBytes, err := l.Bytes(layerDigest)
+	if err != nil {
+		t.Fatalf("(Path).Bytes() = %v", err)
+	}
+	truncatedLayerBytes := completeLayerBytes[:512]
+
+	path := l.path("blobs", layerDigest.Algorithm, layerDigest.Hex)
+	if err := os.WriteFile(path, truncatedLayerBytes, os.ModePerm); err != nil {
+		t.Fatalf("os.WriteFile(layerPath, truncated) = %v", err)
+	}
+
+	// ensure validation fails
+	truncatedImg, err := l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading truncated image for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(truncatedImg); err == nil {
+		t.Fatal("validating image after truncating layer; validate.Image() = nil, expected err")
+	} else if strings.Contains(err.Error(), "unexpected EOF") {
+		t.Fatalf("validating image after truncating layer; validate.Image() error is not helpful: %v", err)
+	}
+
+	// try writing expected contents with ReplaceImage
+	if err := l.ReplaceImage(img, match.Digests(imgDigest)); err != nil {
+		t.Fatalf("error attempting to overwrite truncated layer with valid layer; (Path).ReplaceImage = %v", err)
+	}
+
+	// validation should now succeed
+	repairedImg, err := l.Image(imgDigest)
+	if err != nil {
+		t.Fatalf("error loading truncated image after ReplaceImage for validation; (Path).Image = %v", err)
+	}
+	if err := validate.Image(repairedImg); err != nil {
+		t.Fatalf("validating image after attempting repair of truncated layer with ReplaceImage; validate.Image() = %v", err)
 	}
 }

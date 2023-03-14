@@ -16,11 +16,10 @@ package partial_test
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 
-	"github.com/google/go-containerregistry/pkg/internal/compare"
+	"github.com/google/go-containerregistry/internal/compare"
 	legacy "github.com/google/go-containerregistry/pkg/legacy/tarball"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -112,7 +111,7 @@ func TestUncompressedLayer(t *testing.T) {
 // This is cribbed from pkg/legacy/tarball just to get intra-package coverage.
 func TestLegacyWrite(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -121,7 +120,7 @@ func TestLegacyWrite(t *testing.T) {
 	defer os.Remove(fp.Name())
 
 	// Make a random image + layer with Descriptor().
-	randImage, err := random.Image(256, 8)
+	randImage, err := random.Image(256, 2)
 	if err != nil {
 		t.Fatalf("Error creating random image: %v", err)
 	}
@@ -213,5 +212,22 @@ func TestUncompressed(t *testing.T) {
 	}
 	if _, err := partial.Descriptor(img); err != nil {
 		t.Fatalf("partial.Descriptor: %v", err)
+	}
+
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := partial.UncompressedToLayer(&fastpathLayer{layers[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := partial.Exists(layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ok, true; got != want {
+		t.Errorf("Exists() = %t != %t", got, want)
 	}
 }

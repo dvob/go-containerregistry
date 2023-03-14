@@ -20,58 +20,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-containerregistry/pkg/name"
 )
 
 var (
 	testRegistry, _ = name.NewRegistry("localhost:8080", name.StrictValidation)
 )
-
-func TestChallengeParsing(t *testing.T) {
-	tests := []struct {
-		input  string
-		output map[string]string
-	}{{
-		input: `foo="bar"`,
-		output: map[string]string{
-			"foo": "bar",
-		},
-	}, {
-		input: `foo`,
-		output: map[string]string{
-			"foo": "",
-		},
-	}, {
-		input: `foo="bar",baz="blah"`,
-		output: map[string]string{
-			"foo": "bar",
-			"baz": "blah",
-		},
-	}, {
-		input: `baz="blah", foo="bar"`,
-		output: map[string]string{
-			"foo": "bar",
-			"baz": "blah",
-		},
-	}, {
-		input: `realm="https://gcr.io/v2/token", service="gcr.io", scope="repository:foo/bar:pull"`,
-		output: map[string]string{
-			"realm":   "https://gcr.io/v2/token",
-			"service": "gcr.io",
-			"scope":   "repository:foo/bar:pull",
-		},
-	}}
-
-	for _, test := range tests {
-		params := parseChallenge(test.input)
-		if diff := cmp.Diff(test.output, params); diff != "" {
-			t.Errorf("parseChallenge(%s); (-want +got) %s", test.input, diff)
-		}
-	}
-}
 
 func TestPingNoChallenge(t *testing.T) {
 	server := httptest.NewServer(
@@ -147,6 +105,55 @@ func TestPingBearerChallengeWithParams(t *testing.T) {
 	}
 }
 
+func TestPingMultipleChallenges(t *testing.T) {
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("WWW-Authenticate", "Negotiate")
+			w.Header().Add("WWW-Authenticate", `Basic realm="http://auth.example.com/token"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		}))
+	defer server.Close()
+	tprt := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(server.URL)
+		},
+	}
+
+	pr, err := ping(context.Background(), testRegistry, tprt)
+	if err != nil {
+		t.Errorf("ping() = %v", err)
+	}
+	if pr.challenge != basic {
+		t.Errorf("ping(); got %v, want %v", pr.challenge, basic)
+	}
+	if got, want := len(pr.parameters), 1; got != want {
+		t.Errorf("ping(); got %v, want %v", got, want)
+	}
+}
+
+func TestPingMultipleNotSupportedChallenges(t *testing.T) {
+	server := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("WWW-Authenticate", "Negotiate")
+			w.Header().Add("WWW-Authenticate", "Digest")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		}))
+	defer server.Close()
+	tprt := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(server.URL)
+		},
+	}
+
+	pr, err := ping(context.Background(), testRegistry, tprt)
+	if err != nil {
+		t.Errorf("ping() = %v", err)
+	}
+	if pr.challenge != "negotiate" {
+		t.Errorf("ping(); got %v, want %v", pr.challenge, "negotiate")
+	}
+}
+
 func TestUnsupportedStatus(t *testing.T) {
 	server := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +176,7 @@ func TestUnsupportedStatus(t *testing.T) {
 func TestPingHttpFallback(t *testing.T) {
 	tests := []struct {
 		reg       name.Registry
-		wantCount int
+		wantCount int64
 		err       string
 		contains  []string
 	}{{
@@ -185,10 +192,15 @@ func TestPingHttpFallback(t *testing.T) {
 		contains:  []string{"https://us.gcr.io/v2/", "http://us.gcr.io/v2/"},
 	}}
 
-	gotCount := 0
+	gotCount := int64(0)
 	server := httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			gotCount++
+			atomic.AddInt64(&gotCount, 1)
+			if r.URL.Scheme != "http" {
+				// Sleep a little bit so we can exercise the
+				// happy eyeballs race.
+				time.Sleep(5 * time.Millisecond)
+			}
 			w.WriteHeader(http.StatusOK)
 		}))
 	defer server.Close()
@@ -198,6 +210,8 @@ func TestPingHttpFallback(t *testing.T) {
 			return url.Parse(server.URL)
 		},
 	}
+
+	fallbackDelay = 2 * time.Millisecond
 
 	for _, test := range tests {
 		// This is the last one, fatal error it.

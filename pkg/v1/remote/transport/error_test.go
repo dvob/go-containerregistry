@@ -16,15 +16,13 @@ package transport
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 func TestTemporary(t *testing.T) {
@@ -54,6 +52,13 @@ func TestTemporary(t *testing.T) {
 		error: &Error{
 			Errors: []Diagnostic{{
 				Code: TooManyRequestsErrorCode,
+			}},
+		},
+		retry: true,
+	}, {
+		error: &Error{
+			Errors: []Diagnostic{{
+				Code: UnavailableErrorCode,
 			}},
 		},
 		retry: true,
@@ -140,7 +145,7 @@ func TestCheckErrorNotError(t *testing.T) {
 	for _, test := range tests {
 		resp := &http.Response{
 			StatusCode: test.code,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(test.body)),
+			Body:       io.NopCloser(bytes.NewBufferString(test.body)),
 			Request:    test.request,
 		}
 
@@ -148,77 +153,60 @@ func TestCheckErrorNotError(t *testing.T) {
 		if err == nil {
 			t.Fatalf("CheckError(%d, %s) = nil, wanted error", test.code, test.body)
 		}
-		se, ok := err.(*Error)
-		if !ok {
+		var terr *Error
+		if !errors.As(err, &terr) {
 			t.Fatalf("CheckError(%d, %s) = %v, wanted error type", test.code, test.body, err)
 		}
 
-		if se.StatusCode != test.code {
-			t.Errorf("Incorrect status code, got %d, want %d", se.StatusCode, test.code)
+		if terr.StatusCode != test.code {
+			t.Errorf("Incorrect status code, got %d, want %d", terr.StatusCode, test.code)
 		}
 
-		if se.Error() != test.msg {
-			t.Errorf("Incorrect message, got %q, want %q", se.Error(), test.msg)
+		if terr.Error() != test.msg {
+			t.Errorf("Incorrect message, got %q, want %q", terr.Error(), test.msg)
 		}
 	}
 }
 
 func TestCheckErrorWithError(t *testing.T) {
 	tests := []struct {
-		code  int
-		error *Error
-		msg   string
+		name      string
+		code      int
+		errorBody string
+		msg       string
 	}{{
-		code: http.StatusBadRequest,
-		error: &Error{
-			Errors: []Diagnostic{{
-				Code:    NameInvalidErrorCode,
-				Message: "a message for you",
-			}},
-			StatusCode: 400,
-		},
-		msg: "NAME_INVALID: a message for you",
+		name:      "Invalid name error",
+		code:      http.StatusBadRequest,
+		errorBody: `{"errors":[{"code":"NAME_INVALID","message":"a message for you"}],"StatusCode":400}`,
+		msg:       "NAME_INVALID: a message for you",
 	}, {
-		code: http.StatusBadRequest,
-		error: &Error{
-			StatusCode: 400,
-		},
-		msg: "unexpected status code 400 Bad Request",
+		name:      "Only status code is provided",
+		code:      http.StatusBadRequest,
+		errorBody: `{"StatusCode":400}`,
+		msg:       "unexpected status code 400 Bad Request: {\"StatusCode\":400}",
 	}, {
-		code: http.StatusBadRequest,
-		error: &Error{
-			Errors: []Diagnostic{{
-				Code:    NameInvalidErrorCode,
-				Message: "a message for you",
-			}, {
-				Code:    SizeInvalidErrorCode,
-				Message: "another message for you",
-				Detail:  "with some details",
-			}},
-			StatusCode: 400,
-		},
-		msg: "multiple errors returned: NAME_INVALID: a message for you; SIZE_INVALID: another message for you; with some details",
+		name:      "Multiple diagnostics",
+		code:      http.StatusBadRequest,
+		errorBody: `{"errors":[{"code":"NAME_INVALID","message":"a message for you"}, {"code":"SIZE_INVALID","message":"another message for you", "detail": "with some details"}],"StatusCode":400,"Request":null}`,
+		msg:       "multiple errors returned: NAME_INVALID: a message for you; SIZE_INVALID: another message for you; with some details",
 	}}
 
 	for _, test := range tests {
-		b, err := json.Marshal(test.error)
-		if err != nil {
-			t.Errorf("json.Marshal(%v) = %v", test.error, err)
-		}
-		resp := &http.Response{
-			StatusCode: test.code,
-			Body:       ioutil.NopCloser(bytes.NewBuffer(b)),
-		}
+		t.Run(test.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: test.code,
+				Body:       io.NopCloser(bytes.NewBuffer([]byte(test.errorBody))),
+			}
 
-		if err := CheckError(resp, http.StatusOK); err == nil {
-			t.Errorf("CheckError(%d, %s) = nil, wanted error", test.code, string(b))
-		} else if se, ok := err.(*Error); !ok {
-			t.Errorf("CheckError(%d, %s) = %T, wanted *transport.Error", test.code, string(b), se)
-		} else if diff := cmp.Diff(test.error, se, cmpopts.IgnoreUnexported(Error{})); diff != "" {
-			t.Errorf("CheckError(%d, %s); (-want +got) %s", test.code, string(b), diff)
-		} else if diff := cmp.Diff(test.msg, test.error.Error()); diff != "" {
-			t.Errorf("CheckError(%d, %s).Error(); (-want +got) %s", test.code, string(b), diff)
-		}
+			var terr *Error
+			if err := CheckError(resp, http.StatusOK); err == nil {
+				t.Errorf("CheckError(%d, %s) = nil, wanted error", test.code, test.errorBody)
+			} else if !errors.As(err, &terr) {
+				t.Errorf("CheckError(%d, %s) = %T, wanted *transport.Error", test.code, test.errorBody, err)
+			} else if diff := cmp.Diff(test.msg, err.Error()); diff != "" {
+				t.Errorf("CheckError(%d, %s).Error(); (-want +got) %s", test.code, test.errorBody, diff)
+			}
+		})
 	}
 }
 
@@ -230,7 +218,7 @@ func TestBodyError(t *testing.T) {
 	}
 	if err := CheckError(resp, http.StatusNotFound); err == nil {
 		t.Errorf("CheckError() = nil, wanted error %v", expectedErr)
-	} else if err != expectedErr {
+	} else if !errors.Is(err, expectedErr) {
 		t.Errorf("CheckError() = %v, wanted %v", err, expectedErr)
 	}
 }

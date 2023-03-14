@@ -116,3 +116,42 @@ func TestParseReference(t *testing.T) {
 		}
 	}
 }
+
+func TestMustParseReference(t *testing.T) {
+	for _, name := range append(goodWeakValidationTagNames, goodWeakValidationDigestNames...) {
+		func() {
+			defer func() {
+				if err := recover(); err != nil {
+					t.Errorf("MustParseReference(%q, WeakValidation); panic: %v", name, err)
+				}
+			}()
+			MustParseReference(stringConst(name), WeakValidation)
+		}()
+	}
+
+	for _, name := range append(goodStrictValidationTagNames, goodStrictValidationDigestNames...) {
+		func() {
+			defer func() {
+				if err := recover(); err != nil {
+					t.Errorf("MustParseReference(%q, StrictValidation); panic: %v", name, err)
+				}
+			}()
+			MustParseReference(stringConst(name), StrictValidation)
+		}()
+	}
+
+	for _, name := range append(badTagNames, badDigestNames...) {
+		func() {
+			defer func() { recover() }()
+			ref := MustParseReference(stringConst(name), WeakValidation)
+			t.Errorf("MustParseReference(%q, WeakValidation) should panic, got: %#v", name, ref)
+		}()
+	}
+}
+
+// Test that MustParseReference can accept a const string or string value.
+const str = "valid/string"
+
+var _ = MustParseReference(str)
+var _ = MustParseReference("valid/string")
+var _ = MustParseReference("valid/prefix/" + str)

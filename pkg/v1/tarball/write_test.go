@@ -18,14 +18,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/google/go-containerregistry/pkg/internal/compare"
+	"github.com/google/go-containerregistry/internal/compare"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -37,7 +37,7 @@ import (
 
 func TestWrite(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -87,7 +87,7 @@ func TestWrite(t *testing.T) {
 
 func TestMultiWriteSameImage(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -146,7 +146,7 @@ func TestMultiWriteSameImage(t *testing.T) {
 
 func TestMultiWriteDifferentImages(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -217,7 +217,7 @@ func TestMultiWriteDifferentImages(t *testing.T) {
 
 func TestWriteForeignLayers(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -275,7 +275,7 @@ func TestWriteForeignLayers(t *testing.T) {
 
 func TestWriteSharedLayers(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -356,7 +356,7 @@ func TestWriteSharedLayers(t *testing.T) {
 	for {
 		hdr, err := r.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			t.Fatalf("Get tar header: %v", err)
@@ -378,7 +378,11 @@ func TestWriteSharedLayers(t *testing.T) {
 }
 
 func TestComputeManifest(t *testing.T) {
-	var randomTag, mutatedTag = "gcr.io/foo/bar:latest", "gcr.io/baz/bat:latest"
+	var randomTag, mutatedTag = "ubuntu", "gcr.io/baz/bat:latest"
+
+	// https://github.com/google/go-containerregistry/issues/890
+	randomTagWritten := "ubuntu:latest"
+
 	// Make a random image
 	randImage, err := random.Image(256, 1)
 	if err != nil {
@@ -388,7 +392,7 @@ func TestComputeManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error getting random image config: %v", err)
 	}
-	tag1, err := name.NewTag(randomTag, name.StrictValidation)
+	tag1, err := name.NewTag(randomTag)
 	if err != nil {
 		t.Fatalf("Error creating test tag1.")
 	}
@@ -441,7 +445,7 @@ func TestComputeManifest(t *testing.T) {
 		},
 		{
 			Config:   randConfig.String(),
-			RepoTags: []string{randomTag},
+			RepoTags: []string{randomTagWritten},
 			Layers:   randomLayersFilenames,
 		},
 	}
@@ -477,12 +481,12 @@ func getLayersHashes(img v1.Image) ([]string, error) {
 	hashes := []string{}
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("error getting image layers: %v", err)
+		return nil, fmt.Errorf("error getting image layers: %w", err)
 	}
 	for i, l := range layers {
 		hash, err := l.Digest()
 		if err != nil {
-			return nil, fmt.Errorf("error getting digest for layer %d: %v", i, err)
+			return nil, fmt.Errorf("error getting digest for layer %d: %w", i, err)
 		}
 		hashes = append(hashes, hash.Hex)
 	}

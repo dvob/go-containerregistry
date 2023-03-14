@@ -2,10 +2,6 @@
 
 Validate that an image is well-formed
 
-### Synopsis
-
-Validate that an image is well-formed
-
 ```
 crane validate [flags]
 ```
@@ -13,6 +9,7 @@ crane validate [flags]
 ### Options
 
 ```
+      --fast             Skip downloading/digesting layers
   -h, --help             help for validate
       --remote string    Name of remote image to validate
       --tarball string   Path to tarball to validate
@@ -21,9 +18,10 @@ crane validate [flags]
 ### Options inherited from parent commands
 
 ```
-      --insecure            Allow image references to be fetched without TLS
-      --platform platform   Specifies the platform in the form os/arch[/variant] (e.g. linux/amd64). (default all)
-  -v, --verbose             Enable debug logs
+      --allow-nondistributable-artifacts   Allow pushing non-distributable (foreign) layers
+      --insecure                           Allow image references to be fetched without TLS
+      --platform platform                  Specifies the platform in the form os/arch[/variant][:osversion] (e.g. linux/amd64). (default all)
+  -v, --verbose                            Enable debug logs
 ```
 
 ### SEE ALSO

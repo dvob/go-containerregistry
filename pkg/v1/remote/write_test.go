@@ -17,15 +17,15 @@ package remote
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -166,9 +166,10 @@ func setupWriterWithServer(server *httptest.Server, repo string) (*writer, close
 	}
 
 	return &writer{
-		repo:    tag.Context(),
-		client:  http.DefaultClient,
-		context: context.Background(),
+		repo:      tag.Context(),
+		client:    http.DefaultClient,
+		predicate: defaultRetryPredicate,
+		backoff:   defaultRetryBackoff,
 	}, server, nil
 }
 
@@ -214,7 +215,7 @@ func TestCheckExistingBlob(t *testing.T) {
 			}
 			defer closer.Close()
 
-			existing, err := w.checkExistingBlob(h)
+			existing, err := w.checkExistingBlob(context.Background(), h)
 			if test.existing != existing {
 				t.Errorf("checkExistingBlob() = %v, want %v", existing, test.existing)
 			}
@@ -254,7 +255,7 @@ func TestInitiateUploadNoMountsExists(t *testing.T) {
 	}
 	defer closer.Close()
 
-	_, mounted, err := w.initiateUpload("baz/bar", h.String())
+	_, mounted, err := w.initiateUpload(context.Background(), "baz/bar", h.String(), "")
 	if err != nil {
 		t.Errorf("intiateUpload() = %v", err)
 	}
@@ -292,7 +293,7 @@ func TestInitiateUploadNoMountsInitiated(t *testing.T) {
 	}
 	defer closer.Close()
 
-	location, mounted, err := w.initiateUpload("baz/bar", h.String())
+	location, mounted, err := w.initiateUpload(context.Background(), "baz/bar", h.String(), "")
 	if err != nil {
 		t.Errorf("intiateUpload() = %v", err)
 	}
@@ -331,7 +332,7 @@ func TestInitiateUploadNoMountsBadStatus(t *testing.T) {
 	}
 	defer closer.Close()
 
-	location, mounted, err := w.initiateUpload("baz/bar", h.String())
+	location, mounted, err := w.initiateUpload(context.Background(), "baz/bar", h.String(), "")
 	if err == nil {
 		t.Errorf("intiateUpload() = %v, %v; wanted error", location, mounted)
 	}
@@ -364,7 +365,7 @@ func TestInitiateUploadMountsWithMountFromDifferentRegistry(t *testing.T) {
 	}
 	defer closer.Close()
 
-	_, mounted, err := w.initiateUpload("baz/bar", h.String())
+	_, mounted, err := w.initiateUpload(context.Background(), "baz/bar", h.String(), "")
 	if err != nil {
 		t.Errorf("intiateUpload() = %v", err)
 	}
@@ -404,7 +405,99 @@ func TestInitiateUploadMountsWithMountFromTheSameRegistry(t *testing.T) {
 	}
 	defer closer.Close()
 
-	_, mounted, err := w.initiateUpload(expectedMountRepo, h.String())
+	_, mounted, err := w.initiateUpload(context.Background(), expectedMountRepo, h.String(), "")
+	if err != nil {
+		t.Errorf("intiateUpload() = %v", err)
+	}
+	if !mounted {
+		t.Error("initiateUpload() = !mounted, want mounted")
+	}
+}
+
+func TestInitiateUploadMountsWithOrigin(t *testing.T) {
+	img := setupImage(t)
+	h := mustConfigName(t, img)
+	expectedMountRepo := "a/different/repo"
+	expectedRepo := "yet/again"
+	expectedPath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
+	expectedOrigin := "fakeOrigin"
+	expectedQuery := url.Values{
+		"mount":  []string{h.String()},
+		"from":   []string{expectedMountRepo},
+		"origin": []string{expectedOrigin},
+	}.Encode()
+
+	serverHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("Method; got %v, want %v", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != expectedPath {
+			t.Errorf("URL; got %v, want %v", r.URL.Path, expectedPath)
+		}
+		if r.URL.RawQuery != expectedQuery {
+			t.Errorf("RawQuery; got %v, want %v", r.URL.RawQuery, expectedQuery)
+		}
+		http.Error(w, "Mounted", http.StatusCreated)
+	})
+	server := httptest.NewServer(serverHandler)
+
+	w, closer, err := setupWriterWithServer(server, expectedRepo)
+	if err != nil {
+		t.Fatalf("setupWriterWithServer() = %v", err)
+	}
+	defer closer.Close()
+
+	_, mounted, err := w.initiateUpload(context.Background(), expectedMountRepo, h.String(), "fakeOrigin")
+	if err != nil {
+		t.Errorf("intiateUpload() = %v", err)
+	}
+	if !mounted {
+		t.Error("initiateUpload() = !mounted, want mounted")
+	}
+}
+
+func TestInitiateUploadMountsWithOriginFallback(t *testing.T) {
+	img := setupImage(t)
+	h := mustConfigName(t, img)
+	expectedMountRepo := "a/different/repo"
+	expectedRepo := "yet/again"
+	expectedPath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
+	expectedOrigin := "fakeOrigin"
+	expectedQuery := url.Values{
+		"mount":  []string{h.String()},
+		"from":   []string{expectedMountRepo},
+		"origin": []string{expectedOrigin},
+	}.Encode()
+
+	queries := []string{expectedQuery, ""}
+	queryCount := 0
+
+	serverHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("Method; got %v, want %v", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != expectedPath {
+			t.Errorf("URL; got %v, want %v", r.URL.Path, expectedPath)
+		}
+		if r.URL.RawQuery != queries[queryCount] {
+			t.Errorf("RawQuery; got %v, want %v", r.URL.RawQuery, expectedQuery)
+		}
+		if queryCount == 0 {
+			http.Error(w, "nope", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "Mounted", http.StatusCreated)
+		}
+		queryCount++
+	})
+	server := httptest.NewServer(serverHandler)
+
+	w, closer, err := setupWriterWithServer(server, expectedRepo)
+	if err != nil {
+		t.Fatalf("setupWriterWithServer() = %v", err)
+	}
+	defer closer.Close()
+
+	_, mounted, err := w.initiateUpload(context.Background(), expectedMountRepo, h.String(), "fakeOrigin")
 	if err != nil {
 		t.Errorf("intiateUpload() = %v", err)
 	}
@@ -414,7 +507,7 @@ func TestInitiateUploadMountsWithMountFromTheSameRegistry(t *testing.T) {
 }
 
 func TestDedupeLayers(t *testing.T) {
-	newBlob := func() io.ReadCloser { return ioutil.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, 10000))) }
+	newBlob := func() io.ReadCloser { return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, 10000))) }
 
 	img, err := random.Image(1024, 3)
 	if err != nil {
@@ -516,7 +609,7 @@ func TestStreamBlob(t *testing.T) {
 		if r.URL.Path != expectedPath {
 			t.Errorf("URL; got %v, want %v", r.URL.Path, expectedPath)
 		}
-		got, err := ioutil.ReadAll(r.Body)
+		got, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("ReadAll(Body) = %v", err)
 		}
@@ -541,12 +634,8 @@ func TestStreamBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigLayer: %v", err)
 	}
-	blob, err := l.Compressed()
-	if err != nil {
-		t.Fatalf("layer.Compressed: %v", err)
-	}
 
-	commitLocation, err := w.streamBlob(context.Background(), blob, streamLocation.String())
+	commitLocation, err := w.streamBlob(context.Background(), l, streamLocation.String())
 	if err != nil {
 		t.Errorf("streamBlob() = %v", err)
 	}
@@ -557,7 +646,7 @@ func TestStreamBlob(t *testing.T) {
 
 func TestStreamLayer(t *testing.T) {
 	var n, wantSize int64 = 10000, 49
-	newBlob := func() io.ReadCloser { return ioutil.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, int(n)))) }
+	newBlob := func() io.ReadCloser { return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, int(n)))) }
 	wantDigest := "sha256:3d7c465be28d9e1ed810c42aeb0e747b44441424f566722ba635dc93c947f30e"
 
 	expectedPath := "/vWhatever/I/decide"
@@ -570,7 +659,7 @@ func TestStreamLayer(t *testing.T) {
 			t.Errorf("URL; got %v, want %v", r.URL.Path, expectedPath)
 		}
 
-		h := sha256.New()
+		h := crypto.SHA256.New()
 		s, err := io.Copy(h, r.Body)
 		if err != nil {
 			t.Errorf("Reading body: %v", err)
@@ -593,12 +682,8 @@ func TestStreamLayer(t *testing.T) {
 
 	streamLocation := w.url(expectedPath)
 	sl := stream.NewLayer(newBlob())
-	blob, err := sl.Compressed()
-	if err != nil {
-		t.Fatalf("layer.Compressed: %v", err)
-	}
 
-	commitLocation, err := w.streamBlob(context.Background(), blob, streamLocation.String())
+	commitLocation, err := w.streamBlob(context.Background(), sl, streamLocation.String())
 	if err != nil {
 		t.Errorf("streamBlob: %v", err)
 	}
@@ -634,7 +719,7 @@ func TestCommitBlob(t *testing.T) {
 
 	commitLocation := w.url(expectedPath)
 
-	if err := w.commitBlob(commitLocation.String(), h.String()); err != nil {
+	if err := w.commitBlob(context.Background(), commitLocation.String(), h.String()); err != nil {
 		t.Errorf("commitBlob() = %v", err)
 	}
 }
@@ -647,6 +732,7 @@ func TestUploadOne(t *testing.T) {
 	initiatePath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
 	streamPath := "/path/to/upload"
 	commitPath := "/path/to/commit"
+	ctx := context.Background()
 
 	uploaded := false
 	w, closer, err := setupWriter(expectedRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -669,7 +755,7 @@ func TestUploadOne(t *testing.T) {
 			if r.Method != http.MethodPatch {
 				t.Errorf("Method; got %v, want %v", r.Method, http.MethodPatch)
 			}
-			got, err := ioutil.ReadAll(r.Body)
+			got, err := io.ReadAll(r.Body)
 			if err != nil {
 				t.Errorf("ReadAll(Body) = %v", err)
 			}
@@ -705,11 +791,11 @@ func TestUploadOne(t *testing.T) {
 		Layer:     l,
 		Reference: w.repo.Digest(h.String()),
 	}
-	if err := w.uploadOne(ml); err != nil {
+	if err := w.uploadOne(ctx, ml); err != nil {
 		t.Errorf("uploadOne() = %v", err)
 	}
 	// Hit the existing blob path.
-	if err := w.uploadOne(l); err != nil {
+	if err := w.uploadOne(ctx, l); err != nil {
 		t.Errorf("uploadOne() = %v", err)
 	}
 }
@@ -719,6 +805,7 @@ func TestUploadOneStreamedLayer(t *testing.T) {
 	initiatePath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
 	streamPath := "/path/to/upload"
 	commitPath := "/path/to/commit"
+	ctx := context.Background()
 
 	w, closer, err := setupWriter(expectedRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -750,11 +837,11 @@ func TestUploadOneStreamedLayer(t *testing.T) {
 	defer closer.Close()
 
 	var n, wantSize int64 = 10000, 49
-	newBlob := func() io.ReadCloser { return ioutil.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, int(n)))) }
+	newBlob := func() io.ReadCloser { return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte{'a'}, int(n)))) }
 	wantDigest := "sha256:3d7c465be28d9e1ed810c42aeb0e747b44441424f566722ba635dc93c947f30e"
 	wantDiffID := "sha256:27dd1f61b867b6a0f6e9d8a41c43231de52107e53ae424de8f847b821db4b711"
 	l := stream.NewLayer(newBlob())
-	if err := w.uploadOne(l); err != nil {
+	if err := w.uploadOne(ctx, l); err != nil {
 		t.Fatalf("uploadOne: %v", err)
 	}
 
@@ -777,6 +864,7 @@ func TestUploadOneStreamedLayer(t *testing.T) {
 
 func TestCommitImage(t *testing.T) {
 	img := setupImage(t)
+	ctx := context.Background()
 
 	expectedRepo := "foo/bar"
 	expectedPath := fmt.Sprintf("/v2/%s/manifests/latest", expectedRepo)
@@ -788,7 +876,7 @@ func TestCommitImage(t *testing.T) {
 		if r.URL.Path != expectedPath {
 			t.Errorf("URL; got %v, want %v", r.URL.Path, expectedPath)
 		}
-		got, err := ioutil.ReadAll(r.Body)
+		got, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("ReadAll(Body) = %v", err)
 		}
@@ -813,7 +901,7 @@ func TestCommitImage(t *testing.T) {
 	}
 	defer closer.Close()
 
-	if err := w.commitManifest(img, w.repo.Tag("latest")); err != nil {
+	if err := w.commitManifest(ctx, img, w.repo.Tag("latest")); err != nil {
 		t.Error("commitManifest() = ", err)
 	}
 }
@@ -868,12 +956,10 @@ func TestWriteWithErrors(t *testing.T) {
 	headPathPrefix := fmt.Sprintf("/v2/%s/blobs/", expectedRepo)
 	initiatePath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
 
-	expectedError := &transport.Error{
-		Errors: []transport.Diagnostic{{
-			Code:    transport.NameInvalidErrorCode,
-			Message: "some explanation of how things were messed up.",
-		}},
-		StatusCode: 400,
+	errorBody := `{"errors":[{"code":"NAME_INVALID","message":"some explanation of how things were messed up."}],"StatusCode":400}`
+	expectedErrMsg, err := regexp.Compile(`POST .+ NAME_INVALID: some explanation of how things were messed up.`)
+	if err != nil {
+		t.Error(err)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -888,12 +974,9 @@ func TestWriteWithErrors(t *testing.T) {
 			if r.Method != http.MethodPost {
 				t.Errorf("Method; got %v, want %v", r.Method, http.MethodPost)
 			}
-			b, err := json.Marshal(expectedError)
-			if err != nil {
-				t.Fatalf("json.Marshal() = %v", err)
-			}
+
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write(b)
+			w.Write([]byte(errorBody))
 		default:
 			t.Fatalf("Unexpected path: %v", r.URL.Path)
 		}
@@ -908,12 +991,24 @@ func TestWriteWithErrors(t *testing.T) {
 		t.Fatalf("NewTag() = %v", err)
 	}
 
-	if err := Write(tag, img); err == nil {
+	c := make(chan v1.Update, 100)
+
+	var terr *transport.Error
+	if err := Write(tag, img, WithProgress(c)); err == nil {
 		t.Error("Write() = nil; wanted error")
-	} else if se, ok := err.(*transport.Error); !ok {
-		t.Errorf("Write() = %T; wanted *remote.Error", se)
-	} else if diff := cmp.Diff(expectedError, se, cmpopts.IgnoreUnexported(transport.Error{})); diff != "" {
+	} else if !errors.As(err, &terr) {
+		t.Errorf("Write() = %T; wanted *transport.Error", err)
+	} else if !expectedErrMsg.Match([]byte(terr.Error())) {
+		diff := cmp.Diff(expectedErrMsg, terr.Error())
 		t.Errorf("Write(); (-want +got) = %s", diff)
+	}
+
+	var last v1.Update
+	for update := range c {
+		last = update
+	}
+	if last.Error == nil {
+		t.Error("Progress chan didn't report error")
 	}
 }
 
@@ -1167,7 +1262,7 @@ func TestCheckExistingManifest(t *testing.T) {
 			}
 			defer closer.Close()
 
-			existing, err := w.checkExistingManifest(h, mt)
+			existing, err := w.checkExistingManifest(context.Background(), h, mt)
 			if test.existing != existing {
 				t.Errorf("checkExistingManifest() = %v, want %v", existing, test.existing)
 			}
@@ -1276,7 +1371,7 @@ func (l *fakeForeignLayer) Uncompressed() (io.ReadCloser, error) {
 	return nil, nil
 }
 
-func TestSkipForeignLayers(t *testing.T) {
+func TestSkipForeignLayersByDefault(t *testing.T) {
 	// Set up an image with a foreign layer.
 	base := setupImage(t)
 	img, err := mutate.AppendLayers(base, &fakeForeignLayer{t: t})
@@ -1299,6 +1394,78 @@ func TestSkipForeignLayers(t *testing.T) {
 
 	if err := Write(ref, img); err != nil {
 		t.Errorf("failed to Write: %v", err)
+	}
+}
+
+func TestWriteForeignLayerIfOptionSet(t *testing.T) {
+	// Set up an image with a foreign layer.
+	base := setupImage(t)
+	foreignLayer, err := random.Layer(1024, types.DockerForeignLayer)
+	if err != nil {
+		t.Fatal("random.Layer:", err)
+	}
+	img, err := mutate.AppendLayers(base, foreignLayer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedRepo := "write/time"
+	headPathPrefix := fmt.Sprintf("/v2/%s/blobs/", expectedRepo)
+	initiatePath := fmt.Sprintf("/v2/%s/blobs/uploads/", expectedRepo)
+	manifestPath := fmt.Sprintf("/v2/%s/manifests/latest", expectedRepo)
+	uploadPath := "/upload"
+	commitPath := "/commit"
+	var numUploads int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, headPathPrefix) && r.URL.Path != initiatePath {
+			http.Error(w, "NotFound", http.StatusNotFound)
+			return
+		}
+		switch r.URL.Path {
+		case "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case initiatePath:
+			if r.Method != http.MethodPost {
+				t.Errorf("Method; got %v, want %v", r.Method, http.MethodPost)
+			}
+			w.Header().Set("Location", uploadPath)
+			http.Error(w, "Accepted", http.StatusAccepted)
+		case uploadPath:
+			if r.Method != http.MethodPatch {
+				t.Errorf("Method; got %v, want %v", r.Method, http.MethodPatch)
+			}
+			atomic.AddInt32(&numUploads, 1)
+			w.Header().Set("Location", commitPath)
+			http.Error(w, "Created", http.StatusCreated)
+		case commitPath:
+			http.Error(w, "Created", http.StatusCreated)
+		case manifestPath:
+			if r.Method != http.MethodPut {
+				t.Errorf("Method; got %v, want %v", r.Method, http.MethodPut)
+			}
+			http.Error(w, "Created", http.StatusCreated)
+		default:
+			t.Fatalf("Unexpected path: %v", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%v) = %v", server.URL, err)
+	}
+	tag, err := name.NewTag(fmt.Sprintf("%s/%s:latest", u.Host, expectedRepo), name.WeakValidation)
+	if err != nil {
+		t.Fatalf("NewTag() = %v", err)
+	}
+
+	if err := Write(tag, img, WithNondistributable); err != nil {
+		t.Errorf("Write: %v", err)
+	}
+
+	// 1 random layer, 1 foreign layer, 1 image config blob
+	wantUploads := int32(1 + 1 + 1)
+	if numUploads != wantUploads {
+		t.Fatalf("Write uploaded %d blobs, want %d", numUploads, wantUploads)
 	}
 }
 
@@ -1399,6 +1566,15 @@ func TestNestedIndex(t *testing.T) {
 		Descriptor: v1.Descriptor{
 			URLs: []string{"example.com/url"},
 		},
+	})
+
+	l, err := random.Layer(100, types.DockerLayer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent = mutate.AppendManifests(parent, mutate.IndexAddendum{
+		Add: l,
 	})
 
 	if err := WriteIndex(srcRef, parent); err != nil {

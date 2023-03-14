@@ -2,10 +2,6 @@
 
 List the tags in a repo
 
-### Synopsis
-
-List the tags in a repo
-
 ```
 crane ls REPO [flags]
 ```
@@ -13,15 +9,18 @@ crane ls REPO [flags]
 ### Options
 
 ```
-  -h, --help   help for ls
+      --full-ref           (Optional) if true, print the full image reference
+  -h, --help               help for ls
+      --omit-digest-tags   (Optional), if true, omit digest tags (e.g., ':sha256-...')
 ```
 
 ### Options inherited from parent commands
 
 ```
-      --insecure            Allow image references to be fetched without TLS
-      --platform platform   Specifies the platform in the form os/arch[/variant] (e.g. linux/amd64). (default all)
-  -v, --verbose             Enable debug logs
+      --allow-nondistributable-artifacts   Allow pushing non-distributable (foreign) layers
+      --insecure                           Allow image references to be fetched without TLS
+      --platform platform                  Specifies the platform in the form os/arch[/variant][:osversion] (e.g. linux/amd64). (default all)
+  -v, --verbose                            Enable debug logs
 ```
 
 ### SEE ALSO

@@ -16,15 +16,15 @@ package tarball
 
 import (
 	"archive/tar"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/google/go-containerregistry/pkg/internal/compare"
+	"github.com/google/go-containerregistry/internal/compare"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -37,7 +37,7 @@ import (
 
 func TestWrite(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -90,7 +90,7 @@ func TestWrite(t *testing.T) {
 
 func TestMultiWriteSameImage(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file.")
 	}
@@ -153,7 +153,7 @@ func TestMultiWriteSameImage(t *testing.T) {
 
 func TestMultiWriteDifferentImages(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestMultiWriteDifferentImages(t *testing.T) {
 
 func TestWriteForeignLayers(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestMultiWriteNoHistory(t *testing.T) {
 		t.Fatalf("Error creating test tag: %v", err)
 	}
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestMultiWriteHistoryEmptyLayers(t *testing.T) {
 		t.Fatalf("Error creating test tag: %v", err)
 	}
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -382,15 +382,21 @@ func TestMultiWriteMismatchedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error getting image config: %v", err)
 	}
+
 	// Set the history such that number of history entries != layers. This
 	// should trigger an error during the image write.
 	cfg.History = make([]v1.History, 1)
+	img, err = mutate.ConfigFile(img, cfg)
+	if err != nil {
+		t.Fatalf("mutate.ConfigFile() = %v", err)
+	}
+
 	tag, err := name.NewTag("gcr.io/foo/bar:latest", name.StrictValidation)
 	if err != nil {
 		t.Fatalf("Error creating test tag: %v", err)
 	}
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -446,7 +452,7 @@ func TestUncompressedSize(t *testing.T) {
 		t.Fatalf("Error creating test tag: %v", err)
 	}
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -465,7 +471,7 @@ func TestUncompressedSize(t *testing.T) {
 // share some layers only writes those shared layers once.
 func TestWriteSharedLayers(t *testing.T) {
 	// Make a tempfile for tarball writes.
-	fp, err := ioutil.TempFile("", "")
+	fp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("Error creating temp file: %v", err)
 	}
@@ -561,7 +567,7 @@ func TestWriteSharedLayers(t *testing.T) {
 	for {
 		hdr, err := r.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			t.Fatalf("Get tar header: %v", err)
@@ -585,7 +591,7 @@ func TestWriteSharedLayers(t *testing.T) {
 func v1LayerIDs(img v1.Image) ([]string, error) {
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("get layers: %v", err)
+		return nil, fmt.Errorf("get layers: %w", err)
 	}
 	ids := make([]string, len(layers))
 	parentID := ""
@@ -594,12 +600,12 @@ func v1LayerIDs(img v1.Image) ([]string, error) {
 		if i == len(layers)-1 {
 			rawCfg, err = img.RawConfigFile()
 			if err != nil {
-				return nil, fmt.Errorf("get raw config file: %v", err)
+				return nil, fmt.Errorf("get raw config file: %w", err)
 			}
 		}
 		id, err := v1LayerID(layer, parentID, rawCfg)
 		if err != nil {
-			return nil, fmt.Errorf("get v1 layer ID: %v", err)
+			return nil, fmt.Errorf("get v1 layer ID: %w", err)
 		}
 
 		ids[i] = id

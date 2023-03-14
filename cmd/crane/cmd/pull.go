@@ -16,51 +16,123 @@ package cmd
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/cache"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/spf13/cobra"
 )
 
 // NewCmdPull creates a new cobra.Command for the pull subcommand.
 func NewCmdPull(options *[]crane.Option) *cobra.Command {
-	var cachePath, format string
+	var (
+		cachePath, format string
+		annotateRef       bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "pull IMAGE TARBALL",
-		Short: "Pull a remote image by reference and store its contents in a tarball",
-		Args:  cobra.ExactArgs(2),
-		Run: func(_ *cobra.Command, args []string) {
-			src, path := args[0], args[1]
-			img, err := crane.Pull(src, *options...)
-			if err != nil {
-				log.Fatal(err)
-			}
-			if cachePath != "" {
-				img = cache.Image(img, cache.NewFilesystemCache(cachePath))
+		Short: "Pull remote images by reference and store their contents locally",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			imageMap := map[string]v1.Image{}
+			indexMap := map[string]v1.ImageIndex{}
+			srcList, path := args[:len(args)-1], args[len(args)-1]
+			o := crane.GetOptions(*options...)
+			for _, src := range srcList {
+				ref, err := name.ParseReference(src, o.Name...)
+				if err != nil {
+					return fmt.Errorf("parsing reference %q: %w", src, err)
+				}
+
+				rmt, err := remote.Get(ref, o.Remote...)
+				if err != nil {
+					return err
+				}
+
+				// If we're writing an index to a layout and --platform hasn't been set,
+				// pull the entire index, not just a child image.
+				if format == "oci" && rmt.MediaType.IsIndex() && o.Platform == nil {
+					idx, err := rmt.ImageIndex()
+					if err != nil {
+						return err
+					}
+					indexMap[src] = idx
+					continue
+				}
+
+				img, err := rmt.Image()
+				if err != nil {
+					return err
+				}
+				if cachePath != "" {
+					img = cache.Image(img, cache.NewFilesystemCache(cachePath))
+				}
+				imageMap[src] = img
 			}
 
 			switch format {
 			case "tarball":
-				if err := crane.Save(img, src, path); err != nil {
-					log.Fatalf("saving tarball %s: %v", path, err)
+				if err := crane.MultiSave(imageMap, path); err != nil {
+					return fmt.Errorf("saving tarball %s: %w", path, err)
 				}
 			case "legacy":
-				if err := crane.SaveLegacy(img, src, path); err != nil {
-					log.Fatalf("saving legacy tarball %s: %v", path, err)
+				if err := crane.MultiSaveLegacy(imageMap, path); err != nil {
+					return fmt.Errorf("saving legacy tarball %s: %w", path, err)
 				}
 			case "oci":
-				if err := crane.SaveOCI(img, path); err != nil {
-					log.Fatalf("saving oci image layout %s: %v", path, err)
+				// Don't use crane.MultiSaveOCI so we can control annotations.
+				p, err := layout.FromPath(path)
+				if err != nil {
+					p, err = layout.Write(path, empty.Index)
+					if err != nil {
+						return err
+					}
+				}
+				for ref, img := range imageMap {
+					opts := []layout.Option{}
+					if annotateRef {
+						parsed, err := name.ParseReference(ref, o.Name...)
+						if err != nil {
+							return err
+						}
+						opts = append(opts, layout.WithAnnotations(map[string]string{
+							"org.opencontainers.image.ref.name": parsed.Name(),
+						}))
+					}
+					if err = p.AppendImage(img, opts...); err != nil {
+						return err
+					}
+				}
+
+				for ref, idx := range indexMap {
+					opts := []layout.Option{}
+					if annotateRef {
+						parsed, err := name.ParseReference(ref, o.Name...)
+						if err != nil {
+							return err
+						}
+						opts = append(opts, layout.WithAnnotations(map[string]string{
+							"org.opencontainers.image.ref.name": parsed.Name(),
+						}))
+					}
+					if err := p.AppendIndex(idx, opts...); err != nil {
+						return err
+					}
 				}
 			default:
-				log.Fatalf("unexpected --format: %q (valid values are: tarball, legacy, and oci)", format)
+				return fmt.Errorf("unexpected --format: %q (valid values are: tarball, legacy, and oci)", format)
 			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&cachePath, "cache_path", "c", "", "Path to cache image layers")
 	cmd.Flags().StringVar(&format, "format", "tarball", fmt.Sprintf("Format in which to save images (%q, %q, or %q)", "tarball", "legacy", "oci"))
+	cmd.Flags().BoolVar(&annotateRef, "annotate-ref", false, "Preserves image reference used to pull as an annotation when used with --format=oci")
 
 	return cmd
 }

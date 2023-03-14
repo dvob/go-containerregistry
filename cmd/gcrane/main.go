@@ -15,8 +15,9 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"os"
+	"os/signal"
 
 	"github.com/google/go-containerregistry/cmd/crane/cmd"
 	gcmd "github.com/google/go-containerregistry/cmd/gcrane/cmd"
@@ -37,11 +38,12 @@ const (
 )
 
 func main() {
+	options := []crane.Option{crane.WithAuthFromKeychain(gcrane.Keychain)}
 	// Same as crane, but override usage and keychain.
-	root := cmd.New(use, short, []crane.Option{crane.WithAuthFromKeychain(gcrane.Keychain)})
+	root := cmd.New(use, short, options)
 
 	// Add or override commands.
-	gcraneCmds := []*cobra.Command{gcmd.NewCmdList(), gcmd.NewCmdGc(), gcmd.NewCmdCopy(), cmd.NewCmdAuth("gcrane", "auth")}
+	gcraneCmds := []*cobra.Command{gcmd.NewCmdList(), gcmd.NewCmdGc(), gcmd.NewCmdCopy(), cmd.NewCmdAuth(options, "gcrane", "auth")}
 
 	// Maintain a map of google-specific commands that we "override".
 	used := make(map[string]bool)
@@ -61,8 +63,10 @@ func main() {
 		root.AddCommand(cmd)
 	}
 
-	if err := root.Execute(); err != nil {
-		fmt.Println(err)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
+		cancel()
 		os.Exit(1)
 	}
 }

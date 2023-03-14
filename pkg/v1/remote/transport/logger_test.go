@@ -18,12 +18,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/google/go-containerregistry/pkg/internal/redact"
+	"github.com/google/go-containerregistry/internal/redact"
 	"github.com/google/go-containerregistry/pkg/logs"
 )
 
@@ -49,7 +49,7 @@ func TestLogger(t *testing.T) {
 		Header: http.Header{
 			"Foo": []string{canary},
 		},
-		Body:    ioutil.NopCloser(strings.NewReader(secret)),
+		Body:    io.NopCloser(strings.NewReader(secret)),
 		Request: req,
 	}
 	tr := NewLogger(newRecorder(&cannedResponse, nil))

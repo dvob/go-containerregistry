@@ -1,10 +1,6 @@
 ## crane copy
 
-Efficiently copy a remote image from src to dst
-
-### Synopsis
-
-Efficiently copy a remote image from src to dst
+Efficiently copy a remote image from src to dst while retaining the digest value
 
 ```
 crane copy SRC DST [flags]
@@ -19,9 +15,10 @@ crane copy SRC DST [flags]
 ### Options inherited from parent commands
 
 ```
-      --insecure            Allow image references to be fetched without TLS
-      --platform platform   Specifies the platform in the form os/arch[/variant] (e.g. linux/amd64). (default all)
-  -v, --verbose             Enable debug logs
+      --allow-nondistributable-artifacts   Allow pushing non-distributable (foreign) layers
+      --insecure                           Allow image references to be fetched without TLS
+      --platform platform                  Specifies the platform in the form os/arch[/variant][:osversion] (e.g. linux/amd64). (default all)
+  -v, --verbose                            Enable debug logs
 ```
 
 ### SEE ALSO

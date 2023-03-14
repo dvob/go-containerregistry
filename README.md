@@ -1,11 +1,8 @@
 # go-containerregistry
 
-[![Travis Build Status](https://travis-ci.org/google/go-containerregistry.svg?branch=master)](https://travis-ci.org/google/go-containerregistry)
 [![GitHub Actions Build Status](https://github.com/google/go-containerregistry/workflows/Build/badge.svg)](https://github.com/google/go-containerregistry/actions?query=workflow%3ABuild)
 [![GoDoc](https://godoc.org/github.com/google/go-containerregistry?status.svg)](https://godoc.org/github.com/google/go-containerregistry)
-[![Go Report Card](https://goreportcard.com/badge/google/go-containerregistry)](https://goreportcard.com/report/google/go-containerregistry)
-[![Code Coverage](https://codecov.io/gh/google/go-containerregistry/branch/master/graph/badge.svg)](https://codecov.io/gh/google/go-containerregistry)
-
+[![Code Coverage](https://codecov.io/gh/google/go-containerregistry/branch/main/graph/badge.svg)](https://codecov.io/gh/google/go-containerregistry)
 
 ## Introduction
 
@@ -26,7 +23,7 @@ which can be backed by a variety of medium (e.g. [registry](./pkg/v1/remote/READ
 
 To complement these immutable views, we support functional mutations that produce new immutable views
 of the resulting resource (e.g. [mutate](./pkg/v1/mutate/README.md)).  The end goal is to provide a
-set of versatile primives that can compose to do extraordinarily powerful things efficiently and easily.
+set of versatile primitives that can compose to do extraordinarily powerful things efficiently and easily.
 
 Both the resource views and mutations may be lazy, eager, memoizing, etc, and most are optimized
 for common paths based on the tooling we have seen in the wild (e.g. writing new images from disk
@@ -134,12 +131,18 @@ and registries.
 [`gcrane`](cmd/gcrane/README.md) is a GCR-specific variant of `crane` that has
 richer output for the `ls` subcommand and some basic garbage collection support.
 
+### `krane`
+
+[`krane`](cmd/krane/README.md) is a drop-in replacement for `crane` that supports
+common Kubernetes-based workload identity mechanisms using [`k8schain`](#k8schain)
+as a fallback to traditional authentication mechanisms.
+
 ### `k8schain`
 
 [`k8schain`](pkg/authn/k8schain/README.md) implements the authentication
-semantics use by kubelets in a way that is easily consumable by this library.
+semantics used by kubelets in a way that is easily consumable by this library.
 
-`k8schain` is not a standalone tool, but it's linked here for visibility.
+`k8schain` is not a standalone tool, but it is linked here for visibility.
 
 ### Emeritus: [`ko`](https://github.com/google/ko)
 

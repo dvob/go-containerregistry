@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,8 +30,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	ggcrtest "github.com/google/go-containerregistry/pkg/internal/httptest"
-	"github.com/google/go-containerregistry/pkg/internal/retry"
+	"github.com/google/go-containerregistry/internal/retry"
 	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
@@ -41,14 +41,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
-
-func mustRepo(s string) name.Repository {
-	repo, err := name.NewRepository(s)
-	if err != nil {
-		panic(err)
-	}
-	return repo
-}
 
 type fakeXCR struct {
 	h     http.Handler
@@ -64,16 +56,21 @@ func (xcr *fakeXCR) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		} else {
 			xcr.t.Logf("%+v", tags)
-			json.NewEncoder(w).Encode(tags)
+			if err := json.NewEncoder(w).Encode(tags); err != nil {
+				xcr.t.Fatal(err)
+			}
 		}
 	} else {
 		xcr.h.ServeHTTP(w, r)
 	}
 }
 
-func newFakeXCR(stuff map[name.Reference]partial.Describable, t *testing.T) (*fakeXCR, error) {
+func newFakeXCR(t *testing.T) *fakeXCR {
 	h := registry.New()
+	return &fakeXCR{h: h, t: t}
+}
 
+func (xcr *fakeXCR) setRefs(stuff map[name.Reference]partial.Describable) error {
 	repos := make(map[string]google.Tags)
 
 	for ref, thing := range stuff {
@@ -105,11 +102,11 @@ func newFakeXCR(stuff map[name.Reference]partial.Describable, t *testing.T) (*fa
 		// Populate the "manifests" and "tags" field.
 		d, err := thing.Digest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		mt, err := thing.MediaType()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if tags.Manifests == nil {
 			tags.Manifests = make(map[string]google.ManifestInfo)
@@ -128,14 +125,21 @@ func newFakeXCR(stuff map[name.Reference]partial.Describable, t *testing.T) (*fa
 		tags.Manifests[d.String()] = mi
 		repos[repo] = tags
 	}
-
-	return &fakeXCR{h: h, t: t, repos: repos}, nil
+	xcr.repos = repos
+	return nil
 }
 
 func TestCopy(t *testing.T) {
 	logs.Warn.SetOutput(os.Stderr)
-	src := "xcr.io/test/gcrane"
-	dst := "xcr.io/test/gcrane/copy"
+	xcr := newFakeXCR(t)
+	s := httptest.NewServer(xcr)
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	src := path.Join(u.Host, "test/gcrane")
+	dst := path.Join(u.Host, "test/gcrane/copy")
 
 	oneTag, err := random.Image(1024, 5)
 	if err != nil {
@@ -163,24 +167,15 @@ func TestCopy(t *testing.T) {
 	noTagsRef := latestRef.Context().Digest(d.String())
 	fooRef := latestRef.Context().Tag("foo")
 
-	// Set up a fake registry.
-	h, err := newFakeXCR(map[name.Reference]partial.Describable{
+	// Populate this after we create it so we know the hostname.
+	if err := xcr.setRefs(map[name.Reference]partial.Describable{
 		oneTagRef: oneTag,
 		latestRef: twoTags,
 		fooRef:    twoTags,
 		noTagsRef: noTags,
-	}, t)
-	if err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := ggcrtest.NewTLSServer("xcr.io", h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// Make sure we don't actually talk to XCR.
-	http.DefaultTransport = s.Client().Transport
 
 	if err := remote.Write(latestRef, twoTags); err != nil {
 		t.Fatal(err)
@@ -206,15 +201,15 @@ func TestCopy(t *testing.T) {
 
 func TestRename(t *testing.T) {
 	c := copier{
-		srcRepo: mustRepo("xcr.io/foo"),
-		dstRepo: mustRepo("xcr.io/bar"),
+		srcRepo: name.MustParseReference("registry.example.com/foo").Context(),
+		dstRepo: name.MustParseReference("registry.example.com/bar").Context(),
 	}
 
-	got, err := c.rename(mustRepo("xcr.io/foo/sub/repo"))
+	got, err := c.rename(name.MustParseReference("registry.example.com/foo/sub/repo").Context())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	want := mustRepo("xcr.io/bar/sub/repo")
+	want := name.MustParseReference("registry.example.com/bar/sub/repo").Context()
 
 	if want.String() != got.String() {
 		t.Errorf("%s != %s", want, got)
@@ -389,10 +384,11 @@ func TestRetryErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("backoffErrors should return internal err, got nil")
 	}
-	if te, ok := err.(*transport.Error); !ok {
+	var terr *transport.Error
+	if !errors.As(err, &terr) {
 		t.Fatalf("backoffErrors should return internal err, got different error: %v", err)
-	} else if te.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("backoffErrors should return internal err, got different status code: %v", te.StatusCode)
+	} else if terr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("backoffErrors should return internal err, got different status code: %v", terr.StatusCode)
 	}
 
 	if b.Len() == 0 {

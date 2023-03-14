@@ -1,4 +1,6 @@
+//go:build !arm64
 // +build !arm64
+
 // Copyright 2018 Google LLC All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,6 +58,8 @@ const (
 // out the gcloud dependency of gcloudSource. The exec package does this, too.
 //
 // See: https://www.joeshaw.org/testing-with-os-exec-and-testmain/
+//
+// TODO(#908): This doesn't work on arm64 or darwin for some reason.
 func TestMain(m *testing.M) {
 	switch os.Getenv("GO_TEST_MODE") {
 	case "":
@@ -230,8 +234,10 @@ func TestKeychainError(t *testing.T) {
 
 	// Reset the keychain to ensure we don't cache earlier results.
 	Keychain = &googleKeychain{}
-	if _, err := Keychain.Resolve(mustRegistry("gcr.io")); err == nil {
-		t.Fatalf("expected err, got: %v", err)
+	if auth, err := Keychain.Resolve(mustRegistry("gcr.io")); err != nil {
+		t.Fatalf("got error: %v", err)
+	} else if auth != authn.Anonymous {
+		t.Fatalf("wanted Anonymous, got %v", auth)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/google/go-containerregistry/pkg/v1/validate"
 )
@@ -40,9 +41,15 @@ var (
 		Algorithm: "sha256",
 		Hex:       "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 	}
-	bogusPath        = filepath.Join("testdata", "does_not_exist")
-	testPath         = filepath.Join("testdata", "test_index")
-	testPathOneImage = filepath.Join("testdata", "test_index_one_image")
+	customManifestDigest = v1.Hash{
+		Algorithm: "sha256",
+		Hex:       "b544f71ecd82372bc9a3c0dbef378abfd2734fe437df81ff6e242a0d720d8e3e",
+	}
+	bogusPath                         = filepath.Join("testdata", "does_not_exist")
+	testPath                          = filepath.Join("testdata", "test_index")
+	testPathOneImage                  = filepath.Join("testdata", "test_index_one_image")
+	testPathMediaType                 = filepath.Join("testdata", "test_index_media_type")
+	customMediaType   types.MediaType = "application/tar+gzip"
 )
 
 func TestImage(t *testing.T) {
@@ -99,6 +106,12 @@ func TestImage(t *testing.T) {
 	if got, want := mediaType, types.DockerLayer; got != want {
 		t.Fatalf("MediaType(); want: %q got: %q", want, got)
 	}
+
+	if ok, err := partial.Exists(layers[0]); err != nil {
+		t.Fatal(err)
+	} else if got, want := ok, true; got != want {
+		t.Errorf("Exists() = %t != %t", got, want)
+	}
 }
 
 func TestImageWithEmptyHash(t *testing.T) {
@@ -136,5 +149,33 @@ func TestImageErrors(t *testing.T) {
 
 	if _, err := lp.Image(bogusDigest); err == nil {
 		t.Errorf("Image(%s, %s) = nil, expected err", bogusPath, bogusDigest)
+	}
+}
+
+func TestImageCustomMediaType(t *testing.T) {
+	lp, err := FromPath(testPathMediaType)
+	if err != nil {
+		t.Fatalf("FromPath() = %v", err)
+	}
+	img, err := lp.Image(customManifestDigest)
+	if err != nil {
+		t.Fatalf("Image() = %v", err)
+	}
+	mt, err := img.MediaType()
+	if err != nil {
+		t.Errorf("MediaType() = %v", err)
+	} else if got, want := mt, types.OCIManifestSchema1; got != want {
+		t.Errorf("MediaType(); want: %v got: %v", want, got)
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatalf("img.Layers() = %v", err)
+	}
+	mediaType, err := layers[0].MediaType()
+	if err != nil {
+		t.Fatalf("img.Layers() = %v", err)
+	}
+	if got, want := mediaType, customMediaType; got != want {
+		t.Fatalf("MediaType(); want: %q got: %q", want, got)
 	}
 }

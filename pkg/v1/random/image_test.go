@@ -16,8 +16,8 @@ package random
 
 import (
 	"archive/tar"
+	"errors"
 	"io"
-	"io/ioutil"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -82,13 +82,13 @@ func TestTarLayer(t *testing.T) {
 			t.Errorf("tar.Next: %v", err)
 		}
 
-		if n, err := io.Copy(ioutil.Discard, tr); err != nil {
+		if n, err := io.Copy(io.Discard, tr); err != nil {
 			t.Errorf("Reading tar layer: %v", err)
 		} else if n != 1024 {
 			t.Errorf("Layer %d was %d bytes, want 1024", i, n)
 		}
 
-		if _, err := tr.Next(); err != io.EOF {
+		if _, err := tr.Next(); !errors.Is(err, io.EOF) {
 			t.Errorf("Layer contained more files; got %v, want EOF", err)
 		}
 	}
@@ -117,13 +117,13 @@ func TestRandomLayer(t *testing.T) {
 		t.Fatalf("tar.Next: %v", err)
 	}
 
-	if n, err := io.Copy(ioutil.Discard, tr); err != nil {
+	if n, err := io.Copy(io.Discard, tr); err != nil {
 		t.Errorf("Reading tar layer: %v", err)
 	} else if n != 1024 {
 		t.Errorf("Layer was %d bytes, want 1024", n)
 	}
 
-	if _, err := tr.Next(); err != io.EOF {
+	if _, err := tr.Next(); !errors.Is(err, io.EOF) {
 		t.Errorf("Layer contained more files; got %v, want EOF", err)
 	}
 }

@@ -16,11 +16,13 @@ package google
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,64 +69,6 @@ func TestRoundtrip(t *testing.T) {
 	}
 }
 
-// GCR returns timeUploaded as string
-func TestTimeUploadedMsAsString(t *testing.T) {
-	data := []byte(`
-		{
-			"imageSizeBytes": "100",
-			"mediaType": "hi",
-	  		"tag": ["latest"],
-	  		"timeCreatedMs": "12345678",
-	  		"timeUploadedMs": "23456789"
-		}
-	`)
-
-	raw := rawManifestInfo{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-
-	expectedRaw := rawManifestInfo{
-		Size:      "100",
-		MediaType: "hi",
-		Created:   "12345678",
-		Uploaded:  "23456789",
-		Tags:      []string{"latest"},
-	}
-
-	if diff := cmp.Diff(expectedRaw, raw); diff != "" {
-		t.Errorf("Can't unmarshal rawManifestInfo with string timeUploadedMs: (-want +got) = %s", diff)
-	}
-}
-
-// AR returns timeUploaded as int64, and timeCreatedMs is missing
-func TestTimeUploadedMsAsInt64(t *testing.T) {
-	data := []byte(`
-		{
-			"imageSizeBytes": "100",
-			"mediaType": "hi",
-	  		"tag": ["latest"],
-	  		"timeUploadedMs": 23456789
-		}
-	`)
-
-	raw := rawManifestInfo{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-
-	expectedRaw := rawManifestInfo{
-		Size:      "100",
-		MediaType: "hi",
-		Uploaded:  "23456789",
-		Tags:      []string{"latest"},
-	}
-
-	if diff := cmp.Diff(expectedRaw, raw); diff != "" {
-		t.Errorf("Can't unmarshal rawManifestInfo with int64 timeUploadedMs: (-want +got) = %s", diff)
-	}
-}
-
 func TestList(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -161,17 +105,29 @@ func TestList(t *testing.T) {
 			Tags: []string{"foo", "bar", "baz"},
 		},
 	}, {
+		name:         "just children",
+		responseBody: []byte(`{"child":["hello", "world"]}`),
+		wantErr:      false,
+		wantTags: &Tags{
+			Children: []string{"hello", "world"},
+		},
+	}, {
 		name:         "not json",
 		responseBody: []byte("notjson"),
 		wantErr:      true,
 	}}
 
 	repoName := "ubuntu"
+	// To test WithUserAgent
+	uaSentinel := "this-is-the-user-agent"
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tagsPath := fmt.Sprintf("/v2/%s/tags/list", repoName)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got, want := r.Header.Get("User-Agent"), uaSentinel; !strings.Contains(got, want) {
+					t.Errorf("request did not container useragent, got %q want Contains(%q)", got, want)
+				}
 				switch r.URL.Path {
 				case "/v2/":
 					w.WriteHeader(http.StatusOK)
@@ -196,7 +152,7 @@ func TestList(t *testing.T) {
 				t.Fatalf("name.NewRepository(%v) = %v", repoName, err)
 			}
 
-			tags, err := List(repo, WithAuthFromKeychain(authn.DefaultKeychain), WithTransport(http.DefaultTransport))
+			tags, err := List(repo, WithAuthFromKeychain(authn.DefaultKeychain), WithTransport(http.DefaultTransport), WithUserAgent(uaSentinel), WithContext(context.Background()))
 			if (err != nil) != tc.wantErr {
 				t.Errorf("List() wrong error: %v, want %v: %v\n", (err != nil), tc.wantErr, err)
 			}
@@ -306,5 +262,78 @@ func TestWalk(t *testing.T) {
 				t.Errorf("Walk() wrong tags (-want +got) = %s", diff)
 			}
 		})
+	}
+}
+
+// Copied shamelessly from remote.
+func TestCancelledList(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	repoName := "doesnotmatter"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("Unexpected path: %v", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%v) = %v", server.URL, err)
+	}
+
+	repo, err := name.NewRepository(fmt.Sprintf("%s/%s", u.Host, repoName), name.WeakValidation)
+	if err != nil {
+		t.Fatalf("name.NewRepository(%v) = %v", repoName, err)
+	}
+
+	_, err = List(repo, WithContext(ctx))
+	if !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Errorf("wanted %q to contain %q", err.Error(), context.Canceled.Error())
+	}
+}
+
+func makeResp(hdr string) *http.Response {
+	return &http.Response{
+		Header: http.Header{
+			"Link": []string{hdr},
+		},
+	}
+}
+
+func TestGetNextPageURL(t *testing.T) {
+	for _, hdr := range []string{
+		"",
+		"<",
+		"><",
+		"<>",
+		fmt.Sprintf("<%c>", 0x7f), // makes url.Parse fail
+	} {
+		u, err := getNextPageURL(makeResp(hdr))
+		if err == nil && u != nil {
+			t.Errorf("Expected err, got %+v", u)
+		}
+	}
+
+	good := &http.Response{
+		Header: http.Header{
+			"Link": []string{"<example.com>"},
+		},
+		Request: &http.Request{
+			URL: &url.URL{
+				Scheme: "https",
+			},
+		},
+	}
+	u, err := getNextPageURL(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if u.Scheme != "https" {
+		t.Errorf("expected scheme to match request, got %s", u.Scheme)
 	}
 }

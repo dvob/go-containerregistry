@@ -17,26 +17,29 @@ package crane_test
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
+	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/internal/compare"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
-	"github.com/google/go-containerregistry/pkg/internal/compare"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-// TODO(jonjohnsonjr): Test crane.Delete behavior.
-// TODO(jonjohnsonjr): Test crane.ListTags behavior.
-// TODO(jonjohnsonjr): Test crane.Catalog behavior.
 // TODO(jonjohnsonjr): Test crane.Copy failures.
 func TestCraneRegistry(t *testing.T) {
 	// Set up a fake registry.
@@ -118,7 +121,8 @@ func TestCraneRegistry(t *testing.T) {
 	}
 
 	// Make sure what we copied is equivalent.
-	copied, err := crane.Pull(dst, crane.Insecure, crane.WithTransport(http.DefaultTransport))
+	// Also, get options coverage in a dumb way.
+	copied, err := crane.Pull(dst, crane.Insecure, crane.WithTransport(http.DefaultTransport), crane.WithAuth(authn.Anonymous), crane.WithAuthFromKeychain(authn.DefaultKeychain), crane.WithUserAgent("crane/tests"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +150,73 @@ func TestCraneRegistry(t *testing.T) {
 	}
 
 	if err := compare.Layers(pulledLayer, layer); err != nil {
+		t.Fatal(err)
+	}
+
+	// List Tags
+	// dst variable have: latest and crane-tag
+	tags, err := crane.ListTags(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 2 {
+		t.Fatalf("wanted 2 tags, got %d", len(tags))
+	}
+
+	// create 4 tags for dst
+	for i := 1; i < 5; i++ {
+		if err := crane.Tag(dst, fmt.Sprintf("honk-tag-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tags, err = crane.ListTags(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 6 {
+		t.Fatalf("wanted 6 tags, got %d", len(tags))
+	}
+
+	// Delete the non existing image
+	if err := crane.Delete(dst + ":honk-image"); err == nil {
+		t.Fatal("wanted err, got nil")
+	}
+
+	// Delete the image
+	if err := crane.Delete(src); err != nil {
+		t.Fatal(err)
+	}
+
+	// check if the image was really deleted
+	if _, err := crane.Pull(src); err == nil {
+		t.Fatal("wanted err, got nil")
+	}
+
+	// check if the copied image still exist
+	dstPulled, err := crane.Pull(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compare.Images(dstPulled, copied); err != nil {
+		t.Fatal(err)
+	}
+
+	// List Catalog
+	repos, err := crane.Catalog(u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("wanted 2 repos, got %d", len(repos))
+	}
+
+	// Test pushing layer
+	layer, err = img.LayerByDigest(manifest.Layers[1].Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crane.Upload(layer, dst); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -193,10 +264,87 @@ func TestCraneCopyIndex(t *testing.T) {
 	}
 }
 
+func TestWithPlatform(t *testing.T) {
+	// Set up a fake registry with a platform-specific image.
+	s := httptest.NewServer(registry.New())
+	defer s.Close()
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	imgs := []mutate.IndexAddendum{}
+	for _, plat := range []string{
+		"linux/amd64",
+		"linux/arm",
+	} {
+		img, err := crane.Image(map[string][]byte{
+			"platform.txt": []byte(plat),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts := strings.Split(plat, "/")
+		imgs = append(imgs, mutate.IndexAddendum{
+			Add: img,
+			Descriptor: v1.Descriptor{
+				Platform: &v1.Platform{
+					OS:           parts[0],
+					Architecture: parts[1],
+				},
+			},
+		})
+	}
+
+	idx := mutate.AppendManifests(empty.Index, imgs...)
+
+	src := path.Join(u.Host, "src")
+	dst := path.Join(u.Host, "dst")
+
+	ref, err := name.ParseReference(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Populate registry so we can copy from it.
+	if err := remote.WriteIndex(ref, idx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := crane.Copy(src, dst, crane.WithPlatform(imgs[1].Platform)); err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := crane.Manifest(src, crane.WithPlatform(imgs[1].Platform))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := crane.Manifest(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != string(want) {
+		t.Errorf("Manifest(%q) != Manifest(%q): (\n\n%s\n\n!=\n\n%s\n\n)", dst, src, string(got), string(want))
+	}
+
+	arch := "real fake doors"
+
+	// Now do a fake platform, should fail
+	if _, err := crane.Manifest(src, crane.WithPlatform(&v1.Platform{
+		OS:           "does-not-exist",
+		Architecture: arch,
+	})); err == nil {
+		t.Error("crane.Manifest(fake platform): got nil want err")
+	} else if !strings.Contains(err.Error(), arch) {
+		t.Errorf("crane.Manifest(fake platform): expected %q in error, got: %v", arch, err)
+	}
+}
+
 func TestCraneTarball(t *testing.T) {
 	t.Parallel()
 	// Write an image as a tarball.
-	tmp, err := ioutil.TempFile("", "")
+	tmp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +382,7 @@ func TestCraneTarball(t *testing.T) {
 func TestCraneSaveLegacy(t *testing.T) {
 	t.Parallel()
 	// Write an image as a legacy tarball.
-	tmp, err := ioutil.TempFile("", "")
+	tmp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,11 +401,7 @@ func TestCraneSaveLegacy(t *testing.T) {
 func TestCraneSaveOCI(t *testing.T) {
 	t.Parallel()
 	// Write an image as an OCI image layout.
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	img, err := random.Image(1024, 5)
 	if err != nil {
@@ -270,7 +414,7 @@ func TestCraneSaveOCI(t *testing.T) {
 
 func TestCraneFilesystem(t *testing.T) {
 	t.Parallel()
-	tmp, err := ioutil.TempFile("", "")
+	tmp, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,13 +452,13 @@ func TestCraneFilesystem(t *testing.T) {
 	tr := tar.NewReader(&buf)
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			t.Fatalf("didn't find find")
 		} else if err != nil {
 			t.Fatal(err)
 		}
 		if header.Name == name {
-			b, err := ioutil.ReadAll(tr)
+			b, err := io.ReadAll(tr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,6 +467,49 @@ func TestCraneFilesystem(t *testing.T) {
 			}
 			break
 		}
+	}
+}
+
+func TestStreamingAppend(t *testing.T) {
+	// Stdin will be an uncompressed layer.
+	layer, err := crane.Layer(map[string][]byte{
+		"hello": []byte(`world`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := layer.Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmp, err := os.CreateTemp("", "crane-append")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := io.Copy(tmp, rc); err != nil {
+		t.Fatal(err)
+	}
+
+	stdin := os.Stdin
+	defer func() {
+		os.Stdin = stdin
+	}()
+
+	os.Stdin = tmp
+
+	img, err := crane.Append(empty.Image, "-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ll, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, got := 1, len(ll); want != got {
+		t.Errorf("crane.Append(stdin) - len(layers): want %d != got %d", want, got)
 	}
 }
 
@@ -340,7 +527,7 @@ func TestBadInputs(t *testing.T) {
 
 	// e drops the first parameter so we can use the result of a function
 	// that returns two values as an expression above. This is a bit of a go quirk.
-	e := func(_ interface{}, err error) error {
+	e := func(_ any, err error) error {
 		return err
 	}
 
@@ -349,6 +536,7 @@ func TestBadInputs(t *testing.T) {
 		err  error
 	}{
 		{"Push(_, invalid)", crane.Push(nil, invalid)},
+		{"Upload(_, invalid)", crane.Upload(nil, invalid)},
 		{"Delete(invalid)", crane.Delete(invalid)},
 		{"Delete: 404", crane.Delete(valid404)},
 		{"Save(_, invalid)", crane.Save(nil, invalid, "")},
@@ -361,6 +549,9 @@ func TestBadInputs(t *testing.T) {
 		{"Tag(invalid, invalid)", crane.Tag(invalid, invalid)},
 		{"Tag(404, invalid)", crane.Tag(valid404, invalid)},
 		{"Tag(404, 404)", crane.Tag(valid404, valid404)},
+		{"Optimize(invalid, invalid)", crane.Optimize(invalid, invalid, []string{})},
+		{"Optimize(404, invalid)", crane.Optimize(valid404, invalid, []string{})},
+		{"Optimize(404, 404)", crane.Optimize(valid404, valid404, []string{})},
 		// These return multiple values, which are hard to use as expressions.
 		{"Pull(invalid)", e(crane.Pull(invalid))},
 		{"Digest(invalid)", e(crane.Digest(invalid))},
@@ -373,6 +564,8 @@ func TestBadInputs(t *testing.T) {
 		{"Catalog(invalid)", e(crane.Catalog(invalid))},
 		{"Catalog(404)", e(crane.Catalog(u.Host))},
 		{"PullLayer(invalid)", e(crane.PullLayer(invalid))},
+		{"LoadTag(_, invalid)", e(crane.LoadTag("", invalid))},
+		{"LoadTag(invalid, 404)", e(crane.LoadTag(invalid, valid404))},
 	} {
 		if tc.err == nil {
 			t.Errorf("%s: expected err, got nil", tc.desc)
